@@ -597,15 +597,20 @@ func (c *CommandClient) SelectOutbound(groupTag string, outboundTag string) erro
 }
 
 func (c *CommandClient) URLTest(outboundTag string) error {
-	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+	_, err := c.URLTestWithResult(outboundTag)
+	return err
+}
+
+func (c *CommandClient) URLTestWithResult(outboundTag string) (OutboundGroupItemIterator, error) {
+	result, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*daemon.OutboundList, error) {
 		return client.URLTest(ctx, &daemon.URLTestRequest{
 			OutboundTag: outboundTag,
 		})
 	})
 	if err != nil {
-		return E.Cause(err, "url test")
+		return nil, E.Cause(err, "url test")
 	}
-	return nil
+	return outboundGroupItemListFromGRPC(result), nil
 }
 
 func (c *CommandClient) SetClashMode(newMode string) error {

@@ -73,7 +73,7 @@ type StartedServiceClient interface {
 	GetClashModeStatus(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClashModeStatus, error)
 	SubscribeClashMode(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ClashMode], error)
 	SetClashMode(ctx context.Context, in *ClashMode, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	URLTest(ctx context.Context, in *URLTestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	URLTest(ctx context.Context, in *URLTestRequest, opts ...grpc.CallOption) (*OutboundList, error)
 	SelectOutbound(ctx context.Context, in *SelectOutboundRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SetGroupExpand(ctx context.Context, in *SetGroupExpandRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SubscribeConnections(ctx context.Context, in *SubscribeConnectionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ConnectionEvents], error)
@@ -260,9 +260,9 @@ func (c *startedServiceClient) SetClashMode(ctx context.Context, in *ClashMode, 
 	return out, nil
 }
 
-func (c *startedServiceClient) URLTest(ctx context.Context, in *URLTestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *startedServiceClient) URLTest(ctx context.Context, in *URLTestRequest, opts ...grpc.CallOption) (*OutboundList, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(OutboundList)
 	err := c.cc.Invoke(ctx, StartedService_URLTest_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -711,7 +711,7 @@ type StartedServiceServer interface {
 	GetClashModeStatus(context.Context, *emptypb.Empty) (*ClashModeStatus, error)
 	SubscribeClashMode(*emptypb.Empty, grpc.ServerStreamingServer[ClashMode]) error
 	SetClashMode(context.Context, *ClashMode) (*emptypb.Empty, error)
-	URLTest(context.Context, *URLTestRequest) (*emptypb.Empty, error)
+	URLTest(context.Context, *URLTestRequest) (*OutboundList, error)
 	SelectOutbound(context.Context, *SelectOutboundRequest) (*emptypb.Empty, error)
 	SetGroupExpand(context.Context, *SetGroupExpandRequest) (*emptypb.Empty, error)
 	SubscribeConnections(*SubscribeConnectionsRequest, grpc.ServerStreamingServer[ConnectionEvents]) error
@@ -793,7 +793,7 @@ func (UnimplementedStartedServiceServer) SetClashMode(context.Context, *ClashMod
 	return nil, status.Error(codes.Unimplemented, "method SetClashMode not implemented")
 }
 
-func (UnimplementedStartedServiceServer) URLTest(context.Context, *URLTestRequest) (*emptypb.Empty, error) {
+func (UnimplementedStartedServiceServer) URLTest(context.Context, *URLTestRequest) (*OutboundList, error) {
 	return nil, status.Error(codes.Unimplemented, "method URLTest not implemented")
 }
 

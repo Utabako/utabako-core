@@ -7,7 +7,6 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -140,6 +139,10 @@ func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
 }
 
+func (s *URLTest) URLTestWithResult(ctx context.Context) (map[string]*urltest.Result, error) {
+	return s.group.urlTest(ctx, true)
+}
+
 func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(s.ctx, true)
 }
@@ -222,7 +225,8 @@ type URLTestGroup struct {
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
-	checking                     atomic.Bool
+	checkAccess                  sync.Mutex
+	checking                     *urlTestCall
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -382,17 +386,64 @@ func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
 }
 
 func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return g.urlTest(ctx, true)
+	results, err := g.urlTest(ctx, true)
+	return urlTestDelays(results), err
 }
 
-func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	if g.checking.Swap(true) {
-		return make(map[string]uint16), nil
+type urlTestCall struct {
+	done    chan struct{}
+	force   bool
+	results map[string]*urltest.Result
+	err     error
+}
+
+func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]*urltest.Result, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(g.ctx, func() { cancel(context.Cause(g.ctx)) })
+	defer stop()
+	defer cancel(nil)
+	for {
+		if err := context.Cause(g.ctx); err != nil {
+			return nil, err
+		}
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
+		g.checkAccess.Lock()
+		if running := g.checking; running != nil {
+			g.checkAccess.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, context.Cause(ctx)
+			case <-running.done:
+			}
+			if err := context.Cause(ctx); err != nil {
+				return nil, err
+			}
+			if running.err != nil {
+				return nil, running.err
+			}
+			if force && !running.force {
+				// An interval check can skip recently tested nodes. A manual
+				// request still needs a complete forced pass.
+				continue
+			}
+			return maps.Clone(running.results), nil
+		}
+		running := &urlTestCall{done: make(chan struct{}), force: force}
+		g.checking = running
+		g.checkAccess.Unlock()
+
+		running.results, running.err = URLTestOutboundsWithResult(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+		if running.err == nil {
+			g.performUpdateCheck()
+		}
+		g.checkAccess.Lock()
+		g.checking = nil
+		close(running.done)
+		g.checkAccess.Unlock()
+		return maps.Clone(running.results), running.err
 	}
-	defer g.checking.Store(false)
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
-	g.performUpdateCheck()
-	return result, nil
 }
 
 type urlTestResult struct {
@@ -409,10 +460,27 @@ type urlTestBatch struct {
 	checked  map[string]bool
 	groups   []adapter.OutboundGroup
 	access   sync.Mutex
-	result   map[string]uint16
+	result   map[string]*urltest.Result
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
+	results, _ := URLTestOutboundsWithResult(ctx, outboundManager, history, logger, outbounds, link, interval, force)
+	return urlTestDelays(results)
+}
+
+func urlTestDelays(results map[string]*urltest.Result) map[string]uint16 {
+	delays := make(map[string]uint16)
+	for tag, result := range results {
+		if result.Error == nil {
+			delays[tag] = result.Delay
+		}
+	}
+	return delays
+}
+
+// URLTestOutboundsWithResult returns only results completed by this batch,
+// including failures. Interval-skipped nodes are not reported as new probes.
+func URLTestOutboundsWithResult(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) (map[string]*urltest.Result, error) {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
 		ctx:      ctx,
@@ -421,17 +489,22 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		logger:   logger,
 		batch:    b,
 		checked:  make(map[string]bool),
-		result:   make(map[string]uint16),
+		result:   make(map[string]*urltest.Result),
 	}
 	testBatch.test(outbounds, link, interval, force)
-	b.Wait()
+	err := b.Wait()
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, cause
+	}
+	if err != nil {
+		return nil, err
+	}
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
-		if groupHistory != nil {
-			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
+		if result := testBatch.result[RealTag(outboundGroup, N.NetworkTCP)]; result != nil {
+			testBatch.result[outboundGroup.Tag()] = result
 		}
 	}
-	return testBatch.result
+	return testBatch.result, nil
 }
 
 func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
@@ -445,10 +518,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
-				b.access.Lock()
-				maps.Copy(b.result, nestedResult)
-				b.access.Unlock()
+				nestedResult, err := nested.group.urlTest(b.ctx, force)
+				if err != nil {
+					return nil, err
+				}
+				for tag, result := range nestedResult {
+					b.record(tag, result)
+				}
 				return nil, nil
 			})
 		case adapter.OutboundGroup:
@@ -465,6 +541,9 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			}
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
+				if err := context.Cause(b.ctx); err != nil {
+					return nil, err
+				}
 				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
 				defer cancel()
 				testChan := make(chan urlTestResult, 1)
@@ -478,25 +557,28 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				case <-testCtx.Done():
 					testResult.err = testCtx.Err()
 				}
+				if err := context.Cause(b.ctx); err != nil {
+					return nil, err
+				}
 				if testResult.err != nil {
-					if b.ctx.Err() != nil {
-						return nil, nil
-					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
 				} else {
 					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
-					})
-					b.access.Lock()
-					b.result[tag] = testResult.delay
-					b.access.Unlock()
 				}
+				b.record(tag, b.history.StoreURLTestResult(tag, testResult.delay, testResult.err))
 				return nil, nil
 			})
 		}
+	}
+}
+
+func (b *urlTestBatch) record(tag string, result *urltest.Result) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	// A leaf can occur in multiple URL-test groups with their own test URLs.
+	// Keep the latest actual completion, not whichever nested batch ends last.
+	if previous := b.result[tag]; previous == nil || result.Time.After(previous.Time) {
+		b.result[tag] = result
 	}
 }
 

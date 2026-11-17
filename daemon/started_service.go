@@ -587,7 +587,6 @@ func (s *StartedService) SubscribeGroups(empty *emptypb.Empty, server grpc.Serve
 }
 
 func (s *StartedService) readGroups() *Groups {
-	historyStorage := s.instance.urlTestHistoryStorage
 	boxService := s.instance
 	outbounds := boxService.outboundManager.Outbounds()
 	var iGroups []adapter.OutboundGroup
@@ -617,14 +616,7 @@ func (s *StartedService) readGroups() *Groups {
 				continue
 			}
 
-			var item GroupItem
-			item.Tag = itemTag
-			item.Type = itemOutbound.Type()
-			if history := historyStorage.LoadURLTestHistory(group.RealTag(itemOutbound, N.NetworkTCP)); history != nil {
-				item.UrlTestTime = history.Time.Unix()
-				item.UrlTestDelay = int32(history.Delay)
-			}
-			g.Items = append(g.Items, &item)
+			g.Items = append(g.Items, boxService.readGroupItem(itemTag, itemOutbound))
 		}
 		if len(g.Items) == 0 {
 			continue
@@ -632,6 +624,35 @@ func (s *StartedService) readGroups() *Groups {
 		gs.Group = append(gs.Group, &g)
 	}
 	return &gs
+}
+
+func (i *Instance) readGroupItem(tag string, outbound adapter.Outbound) *GroupItem {
+	item := &GroupItem{
+		Tag:  tag,
+		Type: outbound.Type(),
+	}
+	realTag := group.RealTag(outbound, N.NetworkTCP)
+	if history := i.urlTestHistoryStorage.LoadURLTestHistory(realTag); history != nil {
+		item.UrlTestTime = history.Time.Unix()
+		item.UrlTestDelay = int32(history.Delay)
+	}
+	item.UrlTestResult = urlTestResultToGRPC(i.urlTestHistoryStorage.LoadURLTestResult(realTag))
+	return item
+}
+
+func urlTestResultToGRPC(result *urltest.Result) *URLTestResult {
+	if result == nil {
+		return nil
+	}
+	message := &URLTestResult{
+		Time:    result.Time.Unix(),
+		Delay:   int32(result.Delay),
+		Success: result.Error == nil,
+	}
+	if result.Error != nil {
+		message.Error = result.Error.Error()
+	}
+	return message
 }
 
 func (s *StartedService) GetClashModeStatus(ctx context.Context, empty *emptypb.Empty) (*ClashModeStatus, error) {
@@ -714,7 +735,7 @@ func (s *StartedService) SetClashMode(ctx context.Context, request *ClashMode) (
 	return &emptypb.Empty{}, nil
 }
 
-func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (*emptypb.Empty, error) {
+func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (*OutboundList, error) {
 	s.serviceAccess.RLock()
 	if s.serviceStatus.Status != ServiceStatus_STARTED {
 		s.serviceAccess.RUnlock()
@@ -723,35 +744,64 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
 	outboundTag := request.OutboundTag
-	outbound, isLoaded := boxService.outboundManager.Outbound(outboundTag)
+	detour, isLoaded := boxService.outboundManager.Outbound(outboundTag)
 	if !isLoaded {
 		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
 	}
-	historyStorage := boxService.urlTestHistoryStorage
-	urlTest, isURLTest := outbound.(*group.URLTest)
-	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
-	if isURLTest {
-		go urlTest.CheckOutbounds()
-	} else if isOutboundGroup {
-		outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
-			itOutbound, _ := boxService.outboundManager.Outbound(it)
-			return itOutbound
-		}))
-		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
-	} else {
-		go func() {
-			t, err := urltest.URLTest(boxService.ctx, "", outbound)
-			if err != nil {
-				historyStorage.DeleteURLTestHistory(outboundTag)
-			} else {
-				historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: t,
-				})
-			}
-		}()
+	// Keep the instance's services (including its root certificates) while
+	// binding probe lifetime to both the request and the running instance.
+	testCtx, cancel := context.WithCancelCause(boxService.ctx)
+	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	defer stop()
+	defer cancel(nil)
+	if err := context.Cause(ctx); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
-	return &emptypb.Empty{}, nil
+	if err := context.Cause(testCtx); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	historyStorage := boxService.urlTestHistoryStorage
+	var (
+		results map[string]*urltest.Result
+		err     error
+	)
+	switch outbound := detour.(type) {
+	case *group.URLTest:
+		results, err = outbound.URLTestWithResult(testCtx)
+		if result := results[group.RealTag(outbound, N.NetworkTCP)]; result != nil {
+			results[outboundTag] = result
+		}
+	case adapter.OutboundGroup:
+		results, err = group.URLTestOutboundsWithResult(testCtx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), []adapter.Outbound{outbound}, "", 0, true)
+	default:
+		delay, probeErr := urltest.URLTest(testCtx, "", outbound)
+		if context.Cause(testCtx) == nil {
+			results = map[string]*urltest.Result{
+				outboundTag: historyStorage.StoreURLTestResult(outboundTag, delay, probeErr),
+			}
+		}
+	}
+	if cause := context.Cause(testCtx); cause != nil {
+		return nil, status.FromContextError(cause).Err()
+	}
+	if err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	response := &OutboundList{}
+	for tag, result := range results {
+		outbound, _ := boxService.outboundManager.Outbound(tag)
+		item := &GroupItem{
+			Tag:           tag,
+			Type:          outbound.Type(),
+			UrlTestResult: urlTestResultToGRPC(result),
+		}
+		if result.Error == nil {
+			item.UrlTestTime = result.Time.Unix()
+			item.UrlTestDelay = int32(result.Delay)
+		}
+		response.Outbounds = append(response.Outbounds, item)
+	}
+	return response, nil
 }
 
 func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutboundRequest) (*emptypb.Empty, error) {
@@ -1174,28 +1224,11 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 		s.serviceAccess.RUnlock()
 		var list OutboundList
 		if started {
-			historyStorage := boxService.urlTestHistoryStorage
 			for _, ob := range boxService.outboundManager.Outbounds() {
-				item := &GroupItem{
-					Tag:  ob.Tag(),
-					Type: ob.Type(),
-				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(ob, N.NetworkTCP)); history != nil {
-					item.UrlTestTime = history.Time.Unix()
-					item.UrlTestDelay = int32(history.Delay)
-				}
-				list.Outbounds = append(list.Outbounds, item)
+				list.Outbounds = append(list.Outbounds, boxService.readGroupItem(ob.Tag(), ob))
 			}
 			for _, ep := range boxService.endpointManager.Endpoints() {
-				item := &GroupItem{
-					Tag:  ep.Tag(),
-					Type: ep.Type(),
-				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(ep, N.NetworkTCP)); history != nil {
-					item.UrlTestTime = history.Time.Unix()
-					item.UrlTestDelay = int32(history.Delay)
-				}
-				list.Outbounds = append(list.Outbounds, item)
+				list.Outbounds = append(list.Outbounds, boxService.readGroupItem(ep.Tag(), ep))
 			}
 		}
 		err = server.Send(&list)
