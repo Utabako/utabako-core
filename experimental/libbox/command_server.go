@@ -190,6 +190,7 @@ func (s *CommandServer) Close() {
 
 type OverrideOptions struct {
 	AutoRedirect   bool
+	DisableIPv6    bool
 	IncludePackage StringIterator
 	ExcludePackage StringIterator
 }
@@ -201,6 +202,7 @@ func (s *CommandServer) StartOrReloadService(configContent string, options *Over
 	}
 	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
 		AutoRedirect:   options.AutoRedirect,
+		DisableIPv6:    options.DisableIPv6,
 		IncludePackage: iteratorToArray(options.IncludePackage),
 		ExcludePackage: iteratorToArray(options.ExcludePackage),
 	})

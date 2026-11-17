@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"net/netip"
 
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -78,6 +79,7 @@ func (s *StartedService) FormatConfig(ctx context.Context, configContent string)
 
 type OverrideOptions struct {
 	AutoRedirect   bool
+	DisableIPv6    bool
 	IncludePackage []string
 	ExcludePackage []string
 }
@@ -94,6 +96,16 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 		return nil, err
 	}
 	if overrideOptions != nil {
+		if overrideOptions.DisableIPv6 {
+			for _, inbound := range options.Inbounds {
+				if tunOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {
+					if err = disableTUNIPv6(tunOptions); err != nil {
+						cancel()
+						return nil, E.Cause(err, "inbound/tun[", inbound.Tag, "]")
+					}
+				}
+			}
+		}
 		for _, inbound := range options.Inbounds {
 			if tunInboundOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {
 				tunInboundOptions.AutoRedirect = overrideOptions.AutoRedirect
@@ -145,6 +157,26 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	i.logFactory = boxInstance.LogFactory()
 	log.SetStdLogger(boxInstance.LogFactory().Logger())
 	return i, nil
+}
+
+// Apply only to parsed runtime options. Legacy fields remain for the TUN
+// constructor to reject, and DNS/routing policy outside the TUN is unchanged.
+func disableTUNIPv6(options *option.TunInboundOptions) error {
+	isIPv4 := func(prefix netip.Prefix) bool { return prefix.Addr().Is4() }
+	options.Address = common.Filter(options.Address, isIPv4)
+	if len(options.DNSAddress) > 0 {
+		dnsAddress := common.Filter(options.DNSAddress, netip.Addr.Is4)
+		if len(dnsAddress) == 0 {
+			// An empty list means derive DNS from the interface address, not
+			// "no DNS". Do not replace an explicit IPv6-only DNS configuration.
+			return E.New("disable IPv6: no IPv4 TUN DNS address configured")
+		}
+		options.DNSAddress = dnsAddress
+	}
+	options.RouteAddress = common.Filter(options.RouteAddress, isIPv4)
+	options.RouteExcludeAddress = common.Filter(options.RouteExcludeAddress, isIPv4)
+	options.LoopbackAddress = common.Filter(options.LoopbackAddress, netip.Addr.Is4)
+	return nil
 }
 
 func attachInstance(ctx context.Context) *Instance {
