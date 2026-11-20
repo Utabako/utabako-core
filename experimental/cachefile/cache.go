@@ -80,13 +80,15 @@ type saveDNSCacheEntry struct {
 	saving     bool
 }
 
-func New(ctx context.Context, logger logger.Logger, options option.CacheFileOptions) *CacheFile {
-	var path string
-	if options.Path != "" {
-		path = options.Path
-	} else {
+// Path resolves the location of the cache file.
+func Path(ctx context.Context, path string) string {
+	if path == "" {
 		path = "cache.db"
 	}
+	return filemanager.BasePath(ctx, path)
+}
+
+func New(ctx context.Context, logger logger.Logger, options option.CacheFileOptions) *CacheFile {
 	var cacheIDBytes []byte
 	if options.CacheID != "" {
 		cacheIDBytes = append([]byte{0}, []byte(options.CacheID)...)
@@ -105,7 +107,7 @@ func New(ctx context.Context, logger logger.Logger, options option.CacheFileOpti
 	return &CacheFile{
 		ctx:          ctx,
 		logger:       logger,
-		path:         filemanager.BasePath(ctx, path),
+		path:         Path(ctx, options.Path),
 		cacheID:      cacheIDBytes,
 		cacheIDText:  options.CacheID,
 		storeFakeIP:  options.StoreFakeIP,

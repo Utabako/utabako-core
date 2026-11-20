@@ -16,8 +16,10 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/httpclient"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/route/rule"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -27,9 +29,9 @@ import (
 var ruleSetSeedPublishAccess sync.Mutex
 
 // PrepareRuleSets validates a configuration and prepares immutable initial_path
-// seeds for remote rule-sets over the current system network. Rule-sets using a
-// ZeroTier endpoint are fetched at startup instead. Explicit initial_path values
-// are validated, not replaced. Save the returned configuration only on success.
+// seeds for remote rule-sets over the current system network. Downloads known
+// to use ZeroTier are deferred until startup. Explicit initial_path values are
+// validated, not replaced. Save the returned configuration only on success.
 func PrepareRuleSets(configContent string) (*StringBox, error) {
 	ctx, cancel := context.WithCancel(baseContext(nil))
 	defer cancel()
@@ -93,7 +95,11 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 					if err != nil {
 						return nil, E.Cause(err, "prepare ", origin)
 					}
-					if ruleSetUsesZeroTier(options, transport) {
+					usesZeroTier, err := ruleSetUsesZeroTier(ctx, options, transport)
+					if err != nil {
+						return nil, E.Cause(err, "prepare ", origin)
+					}
+					if usesZeroTier {
 						request, err := http.NewRequest(http.MethodGet, url, nil)
 						if err != nil {
 							return nil, E.Cause(err, "prepare ", origin)
@@ -280,26 +286,54 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 	return wrapString(string(preparedConfig)), nil
 }
 
-func ruleSetUsesZeroTier(options option.Options, transport option.HTTPClientOptions) bool {
+func ruleSetUsesZeroTier(ctx context.Context, options option.Options, transport option.HTTPClientOptions) (bool, error) {
 	tag := transport.Detour
 	if tag == "" && transport.DefaultOutbound {
 		tag = options.Route.Final
-	}
-	if tag == "" {
-		return false
-	}
-	// Explicit outbounds take precedence over endpoints with the same tag.
-	for i, outbound := range options.Outbounds {
-		if outbound.Tag == tag || (outbound.Tag == "" && strconv.Itoa(i) == tag) {
-			return false
+		if tag == "" && len(options.Outbounds) > 0 {
+			tag = options.Outbounds[0].Tag
+			if tag == "" {
+				tag = "0"
+			}
 		}
 	}
-	for i, endpoint := range options.Endpoints {
-		if endpoint.Tag == tag || (endpoint.Tag == "" && strconv.Itoa(i) == tag) {
-			return endpoint.Type == C.TypeZeroTier
+resolve:
+	for depth := 0; tag != "" && depth <= len(options.Outbounds); depth++ {
+		// Explicit outbounds take precedence over endpoints with the same tag.
+		for i, outbound := range options.Outbounds {
+			if outbound.Tag != tag && (outbound.Tag != "" || strconv.Itoa(i) != tag) {
+				continue
+			}
+			selector, isSelector := outbound.Options.(*option.SelectorOutboundOptions)
+			if !isSelector {
+				return false, nil
+			}
+			if depth == 0 {
+				// The mobile runtime also uses a cache with no cache_file block.
+				// An existing cache can override the selector's configured default.
+				var path string
+				if options.Experimental != nil && options.Experimental.CacheFile != nil {
+					path = options.Experimental.CacheFile.Path
+				}
+				if _, err := os.Lstat(cachefile.Path(ctx, path)); !os.IsNotExist(err) {
+					return false, nil
+				}
+			}
+			selected, err := group.InitialSelectorTag(selector.Outbounds, selector.Default, "")
+			if err != nil {
+				return false, E.Cause(err, "selector[", tag, "]")
+			}
+			tag = selected
+			continue resolve
 		}
+		for i, endpoint := range options.Endpoints {
+			if endpoint.Tag == tag || (endpoint.Tag == "" && strconv.Itoa(i) == tag) {
+				return endpoint.Type == C.TypeZeroTier, nil
+			}
+		}
+		return false, nil
 	}
-	return false
+	return false, nil
 }
 
 func checkRuleSetBootstrapHTTP(certificates *option.CertificateOptions, transport option.HTTPClientOptions, url string) error {

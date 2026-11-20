@@ -6,9 +6,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/experimental/cachefile"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/service/filemanager"
 
 	"github.com/stretchr/testify/require"
 )
@@ -71,6 +78,68 @@ func TestPrepareRuleSetsValidatesDeferredZeroTierConfig(t *testing.T) {
 			result, err := PrepareRuleSets(config)
 			require.Nil(t, result)
 			require.ErrorContains(t, err, testCase.want)
+		})
+	}
+}
+
+func TestPrepareRuleSetsUsesFreshSelectorChoice(t *testing.T) {
+	const selector = `{"type":"selector","tag":"pick","outbounds":["system","private-network"],"default":"private-network"}`
+	const direct = `{"type":"direct","tag":"system"}`
+	for _, test := range []struct {
+		name, outbounds, detour, cachePath string
+		deferred                           bool
+	}{
+		{name: "configured default", outbounds: selector + "," + direct, detour: "pick", deferred: true},
+		{name: "first member", outbounds: `{"type":"selector","tag":"pick","outbounds":["private-network","system"]},` + direct, detour: "pick", deferred: true},
+		{name: "nested through implicit default outbound", outbounds: `{"type":"selector","tag":"outer","outbounds":["pick"]},` + selector + "," + direct, deferred: true},
+		{name: "current member is direct", outbounds: `{"type":"selector","tag":"pick","outbounds":["private-network","system"],"default":"system"},` + direct, detour: "pick"},
+		{name: "urltest remains dynamic", outbounds: `{"type":"urltest","tag":"pick","outbounds":["private-network","system"]},` + direct, detour: "pick"},
+		{name: "existing default cache", outbounds: selector + "," + direct, detour: "pick", cachePath: "cache.db"},
+		{name: "existing configured cache", outbounds: selector + "," + direct, detour: "pick", cachePath: "profile.db"},
+		{name: "direct detour with existing cache", outbounds: direct, detour: "private-network", cachePath: "profile.db", deferred: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workingPath := ruleSetTestWorkingPath(t)
+			var cacheOptions string
+			if test.cachePath != "" {
+				ctx := filemanager.WithDefault(baseContext(nil), workingPath, workingPath, os.Getuid(), os.Getgid())
+				logger := log.NewNOPFactory().Logger()
+				scope := adapter.NewScope(ctx, logger)
+				t.Cleanup(func() { require.NoError(t, scope.Close()) })
+				var cacheConfig option.CacheFileOptions
+				if test.cachePath != "cache.db" {
+					cacheConfig.Path, cacheConfig.CacheID = test.cachePath, "profile"
+					cacheOptions = fmt.Sprintf(`,"experimental":{"cache_file":{"path":%q,"cache_id":"profile"}}`, test.cachePath)
+				}
+				cache := cachefile.New(ctx, logger, cacheConfig)
+				require.NoError(t, scope.Start(cache.Name(), cache, adapter.StartStateInitialize))
+				require.NoError(t, cache.StoreSelected("pick", "system"))
+			}
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				_, _ = w.Write([]byte(`{"version":4,"rules":[{"domain":"example.org"}]}`))
+			}))
+			defer server.Close()
+			var remoteClient string
+			if test.detour != "" {
+				remoteClient = fmt.Sprintf(`,"http_client":{"detour":%q}`, test.detour)
+			}
+			config := fmt.Sprintf(`{%s,"outbounds":[%s]%s,"route":{"rule_set":[{"type":"remote","tag":"rules","format":"source","url":%q%s}]}}`, zeroTierRuleSetEndpoint, test.outbounds, cacheOptions, server.URL, remoteClient)
+			result, err := PrepareRuleSets(config)
+			require.NoError(t, err)
+			if test.deferred {
+				require.Equal(t, config, result.Value)
+				require.Zero(t, requests.Load())
+			} else {
+				sets := preparedRuleSets(t, result.Value)
+				require.FileExists(t, sets[0].RemoteOptions.InitialPath)
+				require.EqualValues(t, 1, requests.Load())
+			}
+			require.NoDirExists(t, filepath.Join(workingPath, "zerotier"))
+			if test.cachePath == "" {
+				require.NoFileExists(t, filepath.Join(workingPath, "cache.db"))
+			}
 		})
 	}
 }
