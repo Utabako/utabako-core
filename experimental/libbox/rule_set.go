@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/httpclient"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -25,9 +27,9 @@ import (
 var ruleSetSeedPublishAccess sync.Mutex
 
 // PrepareRuleSets validates a configuration and prepares immutable initial_path
-// seeds for remote rule-sets over the current system network, without starting
-// the prospective configuration. The caller must save the returned configuration
-// only on success. Explicit initial_path values are validated, not replaced.
+// seeds for remote rule-sets over the current system network. Rule-sets using a
+// ZeroTier endpoint are fetched at startup instead. Explicit initial_path values
+// are validated, not replaced. Save the returned configuration only on success.
 func PrepareRuleSets(configContent string) (*StringBox, error) {
 	ctx, cancel := context.WithCancel(baseContext(nil))
 	defer cancel()
@@ -64,20 +66,49 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 	var preparedSets []json.RawMessage
 	var validationSets []option.RuleSet
 	var origins []string
+	type deferredClient struct {
+		origin  string
+		options *option.HTTPClientOptions
+	}
+	var deferredClients []deferredClient
 	if options.Route != nil {
+		httpClients := httpclient.NewManager(ctx, log.NewNOPFactory().Logger(), options.HTTPClients, options.Route.DefaultHTTPClient)
 		for i, set := range options.Route.RuleSet {
 			if set.Type != C.RuleSetTypeRemote {
 				preparedSets = append(preparedSets, rawSets[i])
 				validationSets = append(validationSets, set)
 				continue
 			}
-			for _, tag := range set.Tag {
+			for tagIndex, tag := range set.Tag {
 				url := strings.ReplaceAll(set.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag)
 				origin := fmt.Sprintf("rule-set[%s] from %s", tag, url)
 				origins = append(origins, origin)
 				seedPath := set.RemoteOptions.InitialPath
 				if seedPath == "" {
-					if err = checkRuleSetBootstrapHTTP(options, set.RemoteOptions, url); err != nil {
+					clientOptions, err := set.RemoteOptions.HTTPClientOptions()
+					if err != nil {
+						return nil, E.Cause(err, "prepare ", origin)
+					}
+					transport, err := httpClients.TransportOptions(clientOptions)
+					if err != nil {
+						return nil, E.Cause(err, "prepare ", origin)
+					}
+					if ruleSetUsesZeroTier(options, transport) {
+						request, err := http.NewRequest(http.MethodGet, url, nil)
+						if err != nil {
+							return nil, E.Cause(err, "prepare ", origin)
+						}
+						if (request.URL.Scheme != "http" && request.URL.Scheme != "https") || request.URL.Hostname() == "" {
+							return nil, E.New("prepare ", origin, ": expected an HTTP or HTTPS URL with a host")
+						}
+						if tagIndex == 0 {
+							preparedSets = append(preparedSets, rawSets[i])
+							validationSets = append(validationSets, set)
+							deferredClients = append(deferredClients, deferredClient{origin, clientOptions})
+						}
+						continue
+					}
+					if err = checkRuleSetBootstrapHTTP(options.Certificate, transport, url); err != nil {
 						return nil, E.Cause(err, "prepare ", origin)
 					}
 					if stagingPath == "" {
@@ -148,7 +179,7 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 						return nil, marshalErr
 					}
 					preparedSets = append(preparedSets, prepared)
-				} else if tag == set.Tag[0] {
+				} else if tagIndex == 0 {
 					preparedSets = append(preparedSets, rawSets[i])
 				}
 				localSet := option.RuleSet{
@@ -168,8 +199,8 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 		validationRoute.RuleSet = validationSets
 		options.Route = &validationRoute
 	}
-	// Local construction exposes actual rule metadata to the config's DNS and
-	// route validators. Returned rules remain remote; no VPN or proxy is started.
+	// Local seeds expose their metadata to the validators. ZeroTier rules stay
+	// remote so their metadata is validated when the runtime fetches them.
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
 	instance, err := box.New(box.Options{Context: ctx, Options: options})
 	if err != nil {
@@ -181,6 +212,24 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 		for _, tag := range set.Tag {
 			if loaded, exists := instance.Router().RuleSet(tag); exists {
 				defer loaded.Close()
+			}
+		}
+	}
+	if len(deferredClients) > 0 {
+		manager := service.FromContext[adapter.HTTPClientManager](ctx).(*httpclient.Manager)
+		logger := instance.LogFactory().Logger()
+		scope := adapter.NewScope(ctx, logger)
+		defer scope.Close()
+		if err = scope.Start(manager.Name(), manager, adapter.StartStateStart); err != nil {
+			return nil, E.Cause(err, "validate prepared config")
+		}
+		for _, client := range deferredClients {
+			if client.options == nil {
+				if manager.DefaultTransport() == nil {
+					return nil, E.New("prepare ", client.origin, ": default http client transport is not initialized")
+				}
+			} else if _, err = manager.ResolveTransport(ctx, logger, *client.options); err != nil {
+				return nil, E.Cause(err, "prepare ", client.origin)
 			}
 		}
 	}
@@ -231,37 +280,33 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 	return wrapString(string(preparedConfig)), nil
 }
 
-func checkRuleSetBootstrapHTTP(options option.Options, remote option.RemoteRuleSet, url string) error {
-	var transport option.HTTPClientOptions
-	if remote.HTTPClient != nil && !remote.HTTPClient.IsEmpty() {
-		if remote.DownloadDetour != "" { //nolint:staticcheck
-			return E.New("http_client is conflict with deprecated download_detour field")
-		}
-		transport = *remote.HTTPClient
-	} else if remote.DownloadDetour == "" { //nolint:staticcheck
-		if options.Route != nil {
-			transport.Tag = options.Route.DefaultHTTPClient
-		}
-		if transport.Tag == "" && len(options.HTTPClients) > 0 {
-			transport.Tag = options.HTTPClients[0].Tag
+func ruleSetUsesZeroTier(options option.Options, transport option.HTTPClientOptions) bool {
+	tag := transport.Detour
+	if tag == "" && transport.DefaultOutbound {
+		tag = options.Route.Final
+	}
+	if tag == "" {
+		return false
+	}
+	// Explicit outbounds take precedence over endpoints with the same tag.
+	for i, outbound := range options.Outbounds {
+		if outbound.Tag == tag || (outbound.Tag == "" && strconv.Itoa(i) == tag) {
+			return false
 		}
 	}
-	if transport.Tag != "" {
-		found := false
-		for _, client := range options.HTTPClients {
-			if client.Tag == transport.Tag {
-				transport = client.Options()
-				found = true
-				break
-			}
-		}
-		if !found {
-			return E.New("http_client not found: ", transport.Tag)
+	for i, endpoint := range options.Endpoints {
+		if endpoint.Tag == tag || (endpoint.Tag == "" && strconv.Itoa(i) == tag) {
+			return endpoint.Type == C.TypeZeroTier
 		}
 	}
+	return false
+}
+
+func checkRuleSetBootstrapHTTP(certificates *option.CertificateOptions, transport option.HTTPClientOptions, url string) error {
 	// Detours belong to the prospective runtime. Bootstrap explicitly uses
 	// the current system connection instead, including for shared clients.
 	transport.Detour = ""
+	transport.DisableEmptyDirectCheck = false
 	// The native decoder materializes the default HTTP/2-with-fallback
 	// version. NewHTTPClient already implements that same default.
 	if transport.Version == 2 {
@@ -270,7 +315,7 @@ func checkRuleSetBootstrapHTTP(options option.Options, remote option.RemoteRuleS
 	if !transport.IsEmpty() {
 		return E.New("bootstrap over the current system network does not support custom http_client options; provide a valid initial_path")
 	}
-	return checkRuleSetBootstrapCertificates(options.Certificate, url)
+	return checkRuleSetBootstrapCertificates(certificates, url)
 }
 
 func checkRuleSetBootstrapCertificates(certificates *option.CertificateOptions, url string) error {

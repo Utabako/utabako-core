@@ -188,6 +188,22 @@ func (n *tcpPeerNode) ProcessVirtualNetworkFrame(_, _, _ uint64, etherType, _ ui
 func newTCPTestEndpoint(t *testing.T, forward bool) (*Endpoint, net.Listener, <-chan struct{}) {
 	t.Helper()
 	localPrefix := netip.MustParsePrefix("192.0.2.1/24")
+	ep := newTestEndpoint(t, []netip.Prefix{localPrefix})
+	node, listener, sent := newTCPTestPeer(t, ep, forward)
+	t.Cleanup(func() { require.NoError(t, ep.Close()) })
+	ep.node = node
+	_, err := ep.applyVirtualNetworkConfig(zt.VirtualNetworkConfigOperationConfigUpdate, &zt.VirtualNetworkConfig{
+		Status: zt.NetworkStatusOK, MAC: 0x020000000001, AssignedAddresses: []netip.Prefix{localPrefix},
+	})
+	require.NoError(t, err)
+	require.NoError(t, ep.createStack())
+	ep.learnMAC(M.SocksaddrFromNet(listener.Addr()).Addr, 0x020000000002)
+	ep.goManaged(ep.forwardOutbound)
+	return ep, listener, sent
+}
+
+func newTCPTestPeer(t *testing.T, ep *Endpoint, forward bool) (*tcpPeerNode, net.Listener, <-chan struct{}) {
+	t.Helper()
 	peerPrefix := netip.MustParsePrefix("192.0.2.2/24")
 	peerLink := channel.New(256, 1500, "")
 	t.Cleanup(peerLink.Close)
@@ -201,11 +217,9 @@ func newTCPTestEndpoint(t *testing.T, forward bool) (*Endpoint, net.Listener, <-
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, listener.Close()) })
 
-	ep := newTestEndpoint(t, []netip.Prefix{localPrefix})
-	t.Cleanup(func() { require.NoError(t, ep.Close()) })
 	sent := make(chan struct{})
 	var sentOnce sync.Once
-	ep.node = &tcpPeerNode{send: func(data []byte) {
+	node := &tcpPeerNode{send: func(data []byte) {
 		if header.IPv4(data).Protocol() == uint8(header.TCPProtocolNumber) {
 			sentOnce.Do(func() { close(sent) })
 		}
@@ -215,13 +229,6 @@ func newTCPTestEndpoint(t *testing.T, forward bool) (*Endpoint, net.Listener, <-
 			packet.DecRef()
 		}
 	}}
-	_, err = ep.applyVirtualNetworkConfig(zt.VirtualNetworkConfigOperationConfigUpdate, &zt.VirtualNetworkConfig{
-		Status: zt.NetworkStatusOK, MAC: 0x020000000001, AssignedAddresses: []netip.Prefix{localPrefix},
-	})
-	require.NoError(t, err)
-	require.NoError(t, ep.createStack())
-	ep.learnMAC(peerPrefix.Addr(), 0x020000000002)
-	ep.goManaged(ep.forwardOutbound)
 
 	wireCtx, cancelWire := context.WithCancel(context.Background())
 	var wire sync.WaitGroup
@@ -245,7 +252,7 @@ func newTCPTestEndpoint(t *testing.T, forward bool) (*Endpoint, net.Listener, <-
 		cancelWire()
 		wire.Wait()
 	})
-	return ep, listener, sent
+	return node, listener, sent
 }
 
 func TestEndpointTCPConnectionSurvivesDialContext(t *testing.T) {

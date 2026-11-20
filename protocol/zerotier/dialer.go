@@ -21,6 +21,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 )
 
 func (ep *Endpoint) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
@@ -91,17 +92,56 @@ func (ep *Endpoint) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn
 }
 
 // --- Outbound ---
-func (ep *Endpoint) beginStackCall() (*stack.Stack, error) {
-	ep.lifecycleMu.Lock()
-	defer ep.lifecycleMu.Unlock()
-	if ep.closed.Load() || ep.ipStack == nil {
-		return nil, net.ErrClosed
+func (ep *Endpoint) beginStackCall(ctx context.Context) (*stack.Stack, error) {
+	requestCtx := adapter.RuleSetStartupRequestFromContext(ctx)
+	var finishWait func()
+	for {
+		if requestCtx != nil {
+			if err := requestCtx.Err(); err != nil {
+				return nil, err
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		ep.lifecycleMu.Lock()
+		if ep.closed.Load() || ep.ipStack == nil {
+			ep.lifecycleMu.Unlock()
+			return nil, net.ErrClosed
+		}
+		state := ep.currentNetworkState()
+		pending, err := zeroTierNetworkReadiness(state)
+		if err == nil {
+			ipStack := ep.ipStack
+			ep.stackCalls.Add(1)
+			ep.lifecycleMu.Unlock()
+			return ipStack, nil
+		}
+		ep.lifecycleMu.Unlock()
+		if requestCtx == nil || !pending {
+			return nil, err
+		}
+		select {
+		case <-state.changed:
+			continue
+		default:
+		}
+		if finishWait == nil {
+			if progress := service.PtrFromContext[adapter.RuleSetStartup](requestCtx); progress != nil {
+				finishWait = progress.BeginZeroTierWait()
+				defer finishWait()
+			}
+		}
+		select {
+		case <-state.changed:
+		case <-requestCtx.Done():
+			return nil, requestCtx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ep.done:
+			return nil, net.ErrClosed
+		}
 	}
-	if err := zeroTierNetworkReadyError(ep.currentNetworkState()); err != nil {
-		return nil, err
-	}
-	ep.stackCalls.Add(1)
-	return ep.ipStack, nil
 }
 
 func (ep *Endpoint) stackCallContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -117,7 +157,7 @@ func (ep *Endpoint) stackCallContext(ctx context.Context) (context.Context, cont
 }
 
 func (ep *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	ipStack, err := ep.beginStackCall()
+	ipStack, err := ep.beginStackCall(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +226,7 @@ func (ep *Endpoint) DialContext(ctx context.Context, network string, destination
 }
 
 func (ep *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	ipStack, err := ep.beginStackCall()
+	ipStack, err := ep.beginStackCall(ctx)
 	if err != nil {
 		return nil, err
 	}

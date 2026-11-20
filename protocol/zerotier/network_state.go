@@ -35,6 +35,7 @@ func prefixesEqual(a, b []netip.Prefix) bool {
 
 func (ep *Endpoint) initializeNetworkState(localAddresses []netip.Prefix) {
 	ep.networkState.Store(&endpointNetworkState{
+		changed:        make(chan struct{}),
 		localAddresses: clonePrefixes(localAddresses),
 		mtu:            ep.defaultMTU,
 	})
@@ -99,6 +100,7 @@ func (ep *Endpoint) applyVirtualNetworkConfig(op zt.VirtualNetworkConfigOperatio
 		next.routes = cloneRoutes(current.routes)
 		publishMTU = current.mtu
 	}
+	next.changed = make(chan struct{})
 
 	routesChanged := !routesEqual(current.routes, next.routes)
 	pendingStateChanged := !prefixesEqual(current.localAddresses, next.localAddresses) || routesChanged || current.networkClosed != next.networkClosed || current.status != next.status
@@ -139,6 +141,10 @@ func (ep *Endpoint) applyVirtualNetworkConfig(op zt.VirtualNetworkConfigOperatio
 		topologyChanged = false
 	}
 	ep.mtu.Store(publishMTU)
+	// The published state describes addresses already applied to the stack.
+	if current.changed != nil {
+		close(current.changed)
+	}
 	if op == zt.VirtualNetworkConfigOperationDown || op == zt.VirtualNetworkConfigOperationDestroy {
 		ep.macTableMu.Lock()
 		clear(ep.macTable)
@@ -209,66 +215,56 @@ func (ep *Endpoint) handleVirtualNetworkConfig(nwid uint64, op zt.VirtualNetwork
 	return 0
 }
 
-func zeroTierNetworkStatusError(status zt.VirtualNetworkStatus) error {
-	switch status {
-	case zt.NetworkStatusAccessDenied, zt.NetworkStatusNotFound, zt.NetworkStatusPortError, zt.NetworkStatusAuthenticationRequired:
-		return E.New("zerotier network status ", status.String())
-	default:
-		return nil
-	}
-}
-
-func zeroTierNetworkStateError(state *endpointNetworkState) error {
-	if state.networkClosed {
-		return E.New("zerotier network closed")
-	}
-	return zeroTierNetworkStatusError(state.status)
-}
-
 // waitForNetworkStart permits authorization to complete after Start returns.
 // The control plane and an initially addressless stack remain alive; the config
 // callback installs the runtime addresses and routes once authorization succeeds.
 func (ep *Endpoint) waitForNetworkStart() error {
 	ep.logger.Info("waiting for ZeroTier network configuration")
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
 	deadline := time.NewTimer(60 * time.Second)
 	defer deadline.Stop()
 	for {
+		if err := ep.ctx.Err(); err != nil {
+			return err
+		}
 		state := ep.currentNetworkState()
 		if state.hasConfig && !state.networkClosed {
 			switch state.status {
 			case zt.NetworkStatusAccessDenied, zt.NetworkStatusAuthenticationRequired:
 				ep.logger.Warn("ZeroTier network ", state.status, "; keeping node running while awaiting authorization")
 				return nil
-			case zt.NetworkStatusOK:
-				if len(state.localAddresses) > 0 {
-					return nil
-				}
 			}
 		}
-		if err := zeroTierNetworkStateError(state); err != nil {
+		if pending, err := zeroTierNetworkReadiness(state); !pending {
 			return err
 		}
 		select {
 		case <-ep.done:
 			return E.New("node closed while waiting for ZeroTier network configuration")
+		case <-ep.ctx.Done():
+			return ep.ctx.Err()
 		case <-deadline.C:
 			return E.New("timeout waiting for ZeroTier network configuration")
-		case <-ticker.C:
+		case <-state.changed:
 		}
 	}
 }
 
-func zeroTierNetworkReadyError(state *endpointNetworkState) error {
-	if err := zeroTierNetworkStateError(state); err != nil {
-		return err
+func zeroTierNetworkReadiness(state *endpointNetworkState) (pending bool, err error) {
+	if state.networkClosed {
+		return false, E.New("zerotier network closed")
 	}
-	if !state.hasConfig || state.status != zt.NetworkStatusOK {
-		return E.New("zerotier network status ", state.status.String())
+	if !state.hasConfig {
+		return true, E.New("zerotier network status ", state.status.String())
 	}
-	if len(state.localAddresses) == 0 {
-		return E.New("zerotier network has no assigned addresses")
+	switch state.status {
+	case zt.NetworkStatusOK:
+		if len(state.localAddresses) == 0 {
+			return true, E.New("zerotier network has no assigned addresses")
+		}
+		return false, nil
+	case zt.NetworkStatusRequestingConfiguration, zt.NetworkStatusAccessDenied, zt.NetworkStatusAuthenticationRequired:
+		return true, E.New("zerotier network status ", state.status.String())
+	default:
+		return false, E.New("zerotier network status ", state.status.String())
 	}
-	return nil
 }

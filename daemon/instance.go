@@ -82,17 +82,16 @@ type OverrideOptions struct {
 	DisableIPv6    bool
 	IncludePackage []string
 	ExcludePackage []string
+	Cancellation   *StartupCancellation
+	// Prepare populates runtime overrides after startup has registered and
+	// before touching an existing instance.
+	Prepare func(*OverrideOptions)
 }
 
-func (s *StartedService) newInstance(ctx context.Context, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
-	selectedLocale := locale.FromContext(ctx)
-	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
-	ctx = service.ExtendContext(ctx)
+func (s *StartedService) newInstance(ctx context.Context, cancel context.CancelFunc, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
-	ctx, cancel := context.WithCancel(ctx)
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	if overrideOptions != nil {
@@ -100,7 +99,6 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 			for _, inbound := range options.Inbounds {
 				if tunOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {
 					if err = disableTUNIPv6(tunOptions); err != nil {
-						cancel()
 						return nil, E.Cause(err, "inbound/tun[", inbound.Tag, "]")
 					}
 				}
@@ -129,6 +127,9 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 			})
 		}
 	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 	urlTestHistoryStorage := urltest.NewHistoryStorage()
 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
 	i := &Instance{
@@ -142,7 +143,6 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 		PlatformLogWriter: s,
 	})
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	i.instance = boxInstance

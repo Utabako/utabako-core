@@ -100,6 +100,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
+	var loaded bool
 	if s.cacheFile != nil {
 		savedSet := s.cacheFile.LoadRuleSet(s.tag)
 		if savedSet != nil {
@@ -110,14 +111,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 				if err != nil {
 					s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
 				} else {
+					loaded = true
 					s.lastUpdated = savedSet.LastUpdated
 					s.lastEtag = savedSet.LastEtag
 				}
 			}
 		}
 	}
-	var loadedFromInitialPath bool
-	if s.lastUpdated.IsZero() && s.initialPath != "" {
+	if !loaded && s.initialPath != "" {
 		var content []byte
 		content, err = filemanager.ReadFile(s.ctx, s.initialPath)
 		if err == nil {
@@ -126,11 +127,13 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		if err != nil {
 			s.logger.Warn(E.Cause(err, "load initial rule-set from ", s.initialPath))
 		} else {
-			loadedFromInitialPath = true
+			loaded = true
 		}
 	}
-	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
-		err = s.fetch(ctx, true)
+	if !loaded {
+		fetchCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		err = s.fetch(adapter.ContextWithRuleSetStartupRequest(fetchCtx), true)
 		if err != nil {
 			return E.Cause(err, "initial rule-set: ", s.tag)
 		}
@@ -301,20 +304,15 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 
 func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 	httpClientManager := service.FromContext[adapter.HTTPClientManager](s.ctx)
-	if s.options.RemoteOptions.HTTPClient != nil && !s.options.RemoteOptions.HTTPClient.IsEmpty() {
-		if s.options.RemoteOptions.DownloadDetour != "" { //nolint:staticcheck
-			return nil, E.New("http_client is conflict with deprecated download_detour field")
-		}
-		return httpClientManager.ResolveTransport(s.ctx, s.logger, *s.options.RemoteOptions.HTTPClient)
+	options, err := s.options.RemoteOptions.HTTPClientOptions()
+	if err != nil {
+		return nil, err
 	}
-	if s.options.RemoteOptions.DownloadDetour != "" { //nolint:staticcheck
-		deprecated.Report(s.ctx, deprecated.OptionLegacyRuleSetDownloadDetour)
-		return httpClientManager.ResolveTransport(s.ctx, s.logger, option.HTTPClientOptions{
-			DialerOptions: option.DialerOptions{
-				Detour: s.options.RemoteOptions.DownloadDetour, //nolint:staticcheck
-			},
-			DisableEmptyDirectCheck: true,
-		})
+	if options != nil {
+		if s.options.RemoteOptions.DownloadDetour != "" { //nolint:staticcheck
+			deprecated.Report(s.ctx, deprecated.OptionLegacyRuleSetDownloadDetour)
+		}
+		return httpClientManager.ResolveTransport(s.ctx, s.logger, *options)
 	}
 	defaultTransport := httpClientManager.DefaultTransport()
 	if defaultTransport == nil {

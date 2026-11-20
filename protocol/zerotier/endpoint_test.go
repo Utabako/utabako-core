@@ -483,6 +483,7 @@ func TestEndpointStartReturnsStatusErrors(t *testing.T) {
 	statuses := []zt.VirtualNetworkStatus{
 		zt.NetworkStatusNotFound,
 		zt.NetworkStatusPortError,
+		zt.NetworkStatusClientTooOld,
 	}
 	for _, status := range statuses {
 		t.Run(status.String(), func(t *testing.T) {
@@ -851,6 +852,25 @@ func TestEndpointWaitForNetworkStartReturnsWhenDoneCloses(t *testing.T) {
 		require.ErrorContains(t, err, "node closed")
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("waitForNetworkStart did not return promptly after done closed")
+	}
+}
+
+func TestEndpointWaitForNetworkStartHonorsContextDeadline(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	endpoint, err := NewEndpoint(ctx, nil, logger.NOP(), "network-start-deadline", option.ZeroTierEndpointOptions{NetworkID: "0123456789abcdef"})
+	require.NoError(t, err)
+	ep := endpoint.(*Endpoint)
+	t.Cleanup(func() { require.NoError(t, ep.Close()) })
+	result := make(chan error, 1)
+	go func() { result <- ep.waitForNetworkStart() }()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("startup network wait ignored cancellation")
 	}
 }
 
