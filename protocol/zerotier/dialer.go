@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"time"
 
+	zt "github.com/Utabako/zt"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
@@ -94,7 +95,7 @@ func (ep *Endpoint) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn
 // --- Outbound ---
 func (ep *Endpoint) beginStackCall(ctx context.Context) (*stack.Stack, error) {
 	requestCtx := adapter.RuleSetStartupRequestFromContext(ctx)
-	var finishWait func()
+	var ticker *time.Ticker
 	for {
 		if requestCtx != nil {
 			if err := requestCtx.Err(); err != nil {
@@ -104,13 +105,14 @@ func (ep *Endpoint) beginStackCall(ctx context.Context) (*stack.Stack, error) {
 				return nil, err
 			}
 		}
+
 		ep.lifecycleMu.Lock()
 		if ep.closed.Load() || ep.ipStack == nil {
 			ep.lifecycleMu.Unlock()
 			return nil, net.ErrClosed
 		}
 		state := ep.currentNetworkState()
-		pending, err := zeroTierNetworkReadiness(state)
+		err := zeroTierNetworkReadyError(state)
 		if err == nil {
 			ipStack := ep.ipStack
 			ep.stackCalls.Add(1)
@@ -118,22 +120,25 @@ func (ep *Endpoint) beginStackCall(ctx context.Context) (*stack.Stack, error) {
 			return ipStack, nil
 		}
 		ep.lifecycleMu.Unlock()
-		if requestCtx == nil || !pending {
+
+		if requestCtx == nil || state.networkClosed {
 			return nil, err
 		}
-		select {
-		case <-state.changed:
-			continue
+		switch state.status {
+		case zt.NetworkStatusAccessDenied, zt.NetworkStatusAuthenticationRequired, zt.NetworkStatusRequestingConfiguration, zt.NetworkStatusOK:
+			// Authorization, configuration, or address assignment is pending.
 		default:
+			return nil, err
 		}
-		if finishWait == nil {
+		if ticker == nil {
+			ticker = time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
 			if progress := service.PtrFromContext[adapter.RuleSetStartup](requestCtx); progress != nil {
-				finishWait = progress.BeginZeroTierWait()
-				defer finishWait()
+				defer progress.BeginZeroTierWait()()
 			}
 		}
 		select {
-		case <-state.changed:
+		case <-ticker.C:
 		case <-requestCtx.Done():
 			return nil, requestCtx.Err()
 		case <-ctx.Done():

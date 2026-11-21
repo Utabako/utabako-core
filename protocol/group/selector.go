@@ -88,35 +88,31 @@ func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		s.outbounds[tag] = detour
 	}
 
-	var cachedTag string
 	if s.Tag() != "" {
-		if cache := service.FromContext[adapter.CacheFile](s.ctx); cache != nil {
-			cachedTag = cache.LoadSelected(s.Tag())
+		cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
+		if cacheFile != nil {
+			selected := cacheFile.LoadSelected(s.Tag())
+			if selected != "" {
+				detour, loaded := s.outbounds[selected]
+				if loaded {
+					s.selected.Store(detour)
+					return nil
+				}
+			}
 		}
 	}
-	tag, err := InitialSelectorTag(s.tags, s.defaultTag, cachedTag)
-	if err != nil {
-		return err
-	}
-	s.selected.Store(s.outbounds[tag])
-	return nil
-}
 
-// InitialSelectorTag applies the selection order used when a selector starts.
-func InitialSelectorTag(tags []string, defaultTag, cachedTag string) (string, error) {
-	if cachedTag != "" && slices.Contains(tags, cachedTag) {
-		return cachedTag, nil
-	}
-	if defaultTag != "" {
-		if !slices.Contains(tags, defaultTag) {
-			return "", E.New("default outbound not found: ", defaultTag)
+	if s.defaultTag != "" {
+		detour, loaded := s.outbounds[s.defaultTag]
+		if !loaded {
+			return E.New("default outbound not found: ", s.defaultTag)
 		}
-		return defaultTag, nil
+		s.selected.Store(detour)
+		return nil
 	}
-	if len(tags) == 0 {
-		return "", E.New("missing tags")
-	}
-	return tags[0], nil
+
+	s.selected.Store(s.outbounds[s.tags[0]])
+	return nil
 }
 
 func (s *Selector) All() []string {

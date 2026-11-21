@@ -187,23 +187,6 @@ type RemoteRuleSet struct {
 	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
 }
 
-// HTTPClientOptions returns nil when the rule-set uses the default HTTP client.
-func (r RemoteRuleSet) HTTPClientOptions() (*HTTPClientOptions, error) {
-	if r.HTTPClient != nil && !r.HTTPClient.IsEmpty() {
-		if r.DownloadDetour != "" { //nolint:staticcheck
-			return nil, E.New("http_client is conflict with deprecated download_detour field")
-		}
-		return r.HTTPClient, nil
-	}
-	if r.DownloadDetour != "" { //nolint:staticcheck
-		return &HTTPClientOptions{
-			DialerOptions:           DialerOptions{Detour: r.DownloadDetour}, //nolint:staticcheck
-			DisableEmptyDirectCheck: true,
-		}, nil
-	}
-	return nil, nil
-}
-
 type _HeadlessRule struct {
 	Type           string              `json:"type,omitempty" enum:"default,logical"`
 	DefaultOptions DefaultHeadlessRule `json:"-"`

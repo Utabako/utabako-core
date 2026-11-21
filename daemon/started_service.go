@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"net/netip"
 	"os"
 	"runtime"
@@ -57,9 +56,10 @@ type StartedService struct {
 	// userID           int
 	// groupID          int
 	// systemProxyEnabled      bool
-	lifecycleDone           chan struct{}
+	lifecycleAccess         sync.Mutex
 	serviceAccess           sync.RWMutex
 	closed                  bool
+	startInterrupted        bool
 	startup                 *serviceStartup
 	serviceStatus           *ServiceStatus
 	serviceStatusSubscriber *observable.Subscriber[*ServiceStatus]
@@ -78,21 +78,19 @@ type StartedService struct {
 	notificationObserver    *observable.Observer[*NotificationEvent]
 }
 
-var errStartupInterrupted = errors.New("service startup interrupted")
-
 type serviceStartup struct {
-	progress  adapter.RuleSetStartup
-	interrupt func()
+	cancel   context.CancelFunc
+	progress adapter.RuleSetStartup
 }
 
-// StartupCancellation is a single-use cancellation handle for a start attempt.
-// Cancel also prevents an attempt from starting if called before it is attached.
+// StartupCancellation can be used by one start attempt.
 type StartupCancellation struct {
 	access sync.Mutex
 	used   bool
-	cancel func()
+	cancel context.CancelFunc
 }
 
+// Cancel prevents or interrupts startup. It has no effect after finalization.
 func (c *StartupCancellation) Cancel() {
 	c.access.Lock()
 	defer c.access.Unlock()
@@ -103,7 +101,14 @@ func (c *StartupCancellation) Cancel() {
 	}
 }
 
-func (c *StartupCancellation) attach(cancel func()) bool {
+// Used reports whether the handle was already canceled or claimed by a start.
+func (c *StartupCancellation) Used() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.used
+}
+
+func (c *StartupCancellation) attach(cancel context.CancelFunc) bool {
 	if c == nil {
 		return true
 	}
@@ -117,13 +122,16 @@ func (c *StartupCancellation) attach(cancel func()) bool {
 	return true
 }
 
-func (c *StartupCancellation) detach() {
+// finish detaches the cancel function and reports whether Cancel won the handoff.
+func (c *StartupCancellation) finish() bool {
 	if c == nil {
-		return
+		return false
 	}
 	c.access.Lock()
+	defer c.access.Unlock()
+	interrupted := c.cancel == nil
 	c.cancel = nil
-	c.access.Unlock()
+	return interrupted
 }
 
 type ServiceOptions struct {
@@ -206,37 +214,12 @@ func (s *StartedService) updateStatusError(err error) {
 	s.serviceStatus = statusObject
 }
 
-// lockLifecycle returns with serviceAccess held so a startup can register
-// before another lifecycle operation tries to interrupt it.
-func (s *StartedService) lockLifecycle(ctx context.Context) error {
+func (s *StartedService) interruptStart() {
 	s.serviceAccess.Lock()
-	for {
-		if err := ctx.Err(); err != nil {
-			s.serviceAccess.Unlock()
-			return err
-		}
-		if s.lifecycleDone == nil {
-			s.lifecycleDone = make(chan struct{})
-			return nil
-		}
-		if s.startup != nil {
-			s.startup.interrupt()
-		}
-		done := s.lifecycleDone
-		s.serviceAccess.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-		}
-		s.serviceAccess.Lock()
+	if s.startup != nil {
+		s.startInterrupted = true
+		s.startup.cancel()
 	}
-}
-
-func (s *StartedService) unlockLifecycle() {
-	s.serviceAccess.Lock()
-	close(s.lifecycleDone)
-	s.lifecycleDone = nil
 	s.serviceAccess.Unlock()
 }
 
@@ -330,48 +313,38 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
 	}
 }
 
-func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) (result error) {
+func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
+	// Only the locale comes from the request. The instance outlives that request.
 	selectedLocale := locale.FromContext(ctx)
 	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
-	ctx, cancel := context.WithCancelCause(ctx)
-	startup := &serviceStartup{
-		interrupt: func() { cancel(errStartupInterrupted) },
-	}
+	ctx, cancel := context.WithCancel(ctx)
 	var cancellation *StartupCancellation
 	if options != nil {
 		cancellation = options.Cancellation
 	}
-	if !cancellation.attach(startup.interrupt) {
-		cancel(context.Canceled)
+	if !cancellation.attach(cancel) {
+		cancel()
 		return nil
 	}
-	defer func() {
-		cancellation.detach()
-		if context.Cause(ctx) == errStartupInterrupted {
-			result = nil
-		} else if result != nil {
-			cancel(context.Canceled)
+	s.interruptStart()
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	s.serviceAccess.Lock()
+	if err := ctx.Err(); s.closed || err != nil {
+		if s.closed {
+			err = os.ErrClosed
 		}
-	}()
-	if err := s.lockLifecycle(ctx); err != nil {
+		interrupted := cancellation.finish()
+		s.serviceAccess.Unlock()
+		cancel()
+		if interrupted {
+			return nil
+		}
 		return err
 	}
-	defer s.unlockLifecycle()
-	if s.closed {
-		s.serviceAccess.Unlock()
-		return os.ErrClosed
-	}
+	s.startInterrupted = false
+	startup := &serviceStartup{cancel: cancel}
 	s.startup = startup
-	if ctx.Err() == nil && options != nil && options.Prepare != nil {
-		s.serviceAccess.Unlock()
-		options.Prepare(options)
-		s.serviceAccess.Lock()
-	}
-	if err := ctx.Err(); err != nil {
-		s.startup = nil
-		s.serviceAccess.Unlock()
-		return err
-	}
 	oldInstance := s.instance
 	if oldInstance != nil {
 		s.instance = nil
@@ -394,8 +367,7 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 	var instance *Instance
 	err := ctx.Err()
 	if err == nil {
-		instanceCtx := service.ContextWithPtr(service.ExtendContext(ctx), &startup.progress)
-		instance, err = s.newInstance(instanceCtx, func() { cancel(context.Canceled) }, profileContent, options, oldInstance != nil)
+		instance, err = s.newInstance(ctx, startup, profileContent, options, oldInstance != nil)
 	}
 	if err == nil {
 		instance.urlTestHistoryStorage.AddUpdateHook(s.urlTestSubscriber)
@@ -403,7 +375,8 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 			instance.clashMode.AddUpdateHook(s.clashModeSubscriber)
 		}
 		s.serviceAccess.Lock()
-		if err = ctx.Err(); err == nil {
+		err = ctx.Err()
+		if err == nil {
 			s.instance = instance
 		}
 		s.serviceAccess.Unlock()
@@ -412,20 +385,22 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 		}
 	}
 	s.serviceAccess.Lock()
-	cancellation.detach()
+	// Serialize finalization with both CloseService and OverrideOptions.Cancel.
+	interrupted := cancellation.finish() || s.startInterrupted
+	s.startInterrupted = false
 	s.startup = nil
 	if err == nil {
 		err = ctx.Err()
 	}
-	if err != nil {
+	if interrupted || err != nil {
 		s.instance = nil
-		interrupted := context.Cause(ctx) == errStartupInterrupted
 		if interrupted {
 			s.updateStatus(ServiceStatus_STOPPING)
 		} else {
 			s.updateStatusError(err)
 		}
 		s.serviceAccess.Unlock()
+		cancel()
 		if instance != nil {
 			_ = instance.Close()
 			runtimeDebug.FreeOSMemory()
@@ -435,6 +410,7 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 			s.startedAt = time.Time{}
 			s.updateStatus(ServiceStatus_IDLE)
 			s.serviceAccess.Unlock()
+			return nil
 		}
 		return err
 	}
@@ -457,8 +433,10 @@ func (s *StartedService) Close() {
 }
 
 func (s *StartedService) CloseService() error {
-	_ = s.lockLifecycle(context.Background())
-	defer s.unlockLifecycle()
+	s.interruptStart()
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	s.serviceAccess.Lock()
 	instance := s.instance
 	if instance == nil && s.serviceStatus.Status != ServiceStatus_STARTING && s.serviceStatus.Status != ServiceStatus_STARTED {
 		s.serviceAccess.Unlock()

@@ -83,12 +83,11 @@ type OverrideOptions struct {
 	IncludePackage []string
 	ExcludePackage []string
 	Cancellation   *StartupCancellation
-	// Prepare populates runtime overrides after startup has registered and
-	// before touching an existing instance.
-	Prepare func(*OverrideOptions)
 }
 
-func (s *StartedService) newInstance(ctx context.Context, cancel context.CancelFunc, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
+func (s *StartedService) newInstance(ctx context.Context, startup *serviceStartup, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
+	ctx = service.ExtendContext(ctx)
+	ctx = service.ContextWithPtr(ctx, &startup.progress)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
@@ -134,7 +133,7 @@ func (s *StartedService) newInstance(ctx context.Context, cancel context.CancelF
 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
 	i := &Instance{
 		ctx:                   ctx,
-		cancel:                cancel,
+		cancel:                startup.cancel,
 		urlTestHistoryStorage: urlTestHistoryStorage,
 	}
 	boxInstance, err := box.New(box.Options{

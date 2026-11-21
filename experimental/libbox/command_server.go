@@ -197,24 +197,25 @@ type OverrideOptions struct {
 	cancellation daemon.StartupCancellation
 }
 
-// Cancel aborts this start attempt even if it has not begun. It does not stop a running service.
+// Cancel prevents or interrupts this start attempt, without stopping a running service.
 func (o *OverrideOptions) Cancel() {
 	o.cancellation.Cancel()
 }
 
 func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
+	if options.cancellation.Used() {
+		return nil
+	}
+	saveConfigSnapshot(configContent)
+	if s.powerManager.Recorder() != nil {
+		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
+	}
 	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
-		AutoRedirect: options.AutoRedirect,
-		DisableIPv6:  options.DisableIPv6,
-		Cancellation: &options.cancellation,
-		Prepare: func(overrides *daemon.OverrideOptions) {
-			saveConfigSnapshot(configContent)
-			if s.powerManager.Recorder() != nil {
-				copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
-			}
-			overrides.IncludePackage = iteratorToArray(options.IncludePackage)
-			overrides.ExcludePackage = iteratorToArray(options.ExcludePackage)
-		},
+		AutoRedirect:   options.AutoRedirect,
+		DisableIPv6:    options.DisableIPv6,
+		IncludePackage: iteratorToArray(options.IncludePackage),
+		ExcludePackage: iteratorToArray(options.ExcludePackage),
+		Cancellation:   &options.cancellation,
 	})
 	if err != nil {
 		return E.Cause(err, "start or reload service")
@@ -226,7 +227,7 @@ func (s *CommandServer) CloseService() error {
 	return s.StartedService.CloseService()
 }
 
-// GetStartupStage reports rule-set progress, or an empty string outside rule-set startup.
+// GetStartupStage reports rule-set startup progress, or an empty string otherwise.
 func (s *CommandServer) GetStartupStage() string {
 	return s.StartedService.GetStartupStage()
 }

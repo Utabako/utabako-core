@@ -229,7 +229,6 @@ func newTCPTestPeer(t *testing.T, ep *Endpoint, forward bool) (*tcpPeerNode, net
 			packet.DecRef()
 		}
 	}}
-
 	wireCtx, cancelWire := context.WithCancel(context.Background())
 	var wire sync.WaitGroup
 	wire.Go(func() {

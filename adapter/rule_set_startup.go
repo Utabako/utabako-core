@@ -5,8 +5,7 @@ import (
 	"sync"
 )
 
-// RuleSetStartup reports the current phase while the router loads its rule sets.
-// Its zero value is idle.
+// RuleSetStartup reports router startup progress. Its zero value is idle.
 type RuleSetStartup struct {
 	mu              sync.Mutex
 	loading         bool
@@ -49,8 +48,8 @@ func (s *RuleSetStartup) BeginZeroTierWait() func() {
 
 type ruleSetStartupRequestKey struct{}
 
-// ContextWithRuleSetStartupRequest marks a cold rule-set fetch and preserves its
-// cancellation even when an HTTP transport detaches a dial from the request.
+// ContextWithRuleSetStartupRequest preserves the original cold fetch context
+// even when the HTTP transport detaches its dial from request cancellation.
 func ContextWithRuleSetStartupRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ruleSetStartupRequestKey{}, ctx)
 }

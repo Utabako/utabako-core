@@ -16,10 +16,8 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/httpclient"
 	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/route/rule"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -29,9 +27,9 @@ import (
 var ruleSetSeedPublishAccess sync.Mutex
 
 // PrepareRuleSets validates a configuration and prepares immutable initial_path
-// seeds for remote rule-sets over the current system network. Downloads known
-// to use ZeroTier are deferred until startup. Explicit initial_path values are
-// validated, not replaced. Save the returned configuration only on success.
+// seeds for remote rule-sets over the current system network. Downloads with an
+// explicit ZeroTier path are deferred until startup. Explicit initial_path
+// values are validated, not replaced.
 func PrepareRuleSets(configContent string) (*StringBox, error) {
 	ctx, cancel := context.WithCancel(baseContext(nil))
 	defer cancel()
@@ -68,13 +66,12 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 	var preparedSets []json.RawMessage
 	var validationSets []option.RuleSet
 	var origins []string
-	type deferredClient struct {
-		origin  string
-		options *option.HTTPClientOptions
+	type deferredRuleSet struct {
+		origin    string
+		transport option.HTTPClientOptions
 	}
-	var deferredClients []deferredClient
+	var deferredSets []deferredRuleSet
 	if options.Route != nil {
-		httpClients := httpclient.NewManager(ctx, log.NewNOPFactory().Logger(), options.HTTPClients, options.Route.DefaultHTTPClient)
 		for i, set := range options.Route.RuleSet {
 			if set.Type != C.RuleSetTypeRemote {
 				preparedSets = append(preparedSets, rawSets[i])
@@ -87,19 +84,11 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 				origins = append(origins, origin)
 				seedPath := set.RemoteOptions.InitialPath
 				if seedPath == "" {
-					clientOptions, err := set.RemoteOptions.HTTPClientOptions()
+					transport, err := resolveRuleSetBootstrapHTTP(options, set.RemoteOptions)
 					if err != nil {
 						return nil, E.Cause(err, "prepare ", origin)
 					}
-					transport, err := httpClients.TransportOptions(clientOptions)
-					if err != nil {
-						return nil, E.Cause(err, "prepare ", origin)
-					}
-					usesZeroTier, err := ruleSetUsesZeroTier(ctx, options, transport)
-					if err != nil {
-						return nil, E.Cause(err, "prepare ", origin)
-					}
-					if usesZeroTier {
+					if ruleSetUsesZeroTier(options, transport) {
 						request, err := http.NewRequest(http.MethodGet, url, nil)
 						if err != nil {
 							return nil, E.Cause(err, "prepare ", origin)
@@ -110,7 +99,7 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 						if tagIndex == 0 {
 							preparedSets = append(preparedSets, rawSets[i])
 							validationSets = append(validationSets, set)
-							deferredClients = append(deferredClients, deferredClient{origin, clientOptions})
+							deferredSets = append(deferredSets, deferredRuleSet{origin, transport})
 						}
 						continue
 					}
@@ -205,8 +194,8 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 		validationRoute.RuleSet = validationSets
 		options.Route = &validationRoute
 	}
-	// Local seeds expose their metadata to the validators. ZeroTier rules stay
-	// remote so their metadata is validated when the runtime fetches them.
+	// Local seeds expose their metadata to the validators. Deferred rules
+	// stay remote, and their downloaded content is validated at startup.
 	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
 	instance, err := box.New(box.Options{Context: ctx, Options: options})
 	if err != nil {
@@ -221,23 +210,12 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 			}
 		}
 	}
-	if len(deferredClients) > 0 {
-		manager := service.FromContext[adapter.HTTPClientManager](ctx).(*httpclient.Manager)
-		logger := instance.LogFactory().Logger()
-		scope := adapter.NewScope(ctx, logger)
-		defer scope.Close()
-		if err = scope.Start(manager.Name(), manager, adapter.StartStateStart); err != nil {
-			return nil, E.Cause(err, "validate prepared config")
+	for _, set := range deferredSets {
+		transport, err := httpclient.NewTransport(ctx, instance.LogFactory().Logger(), "", set.transport)
+		if err != nil {
+			return nil, E.Cause(err, "prepare ", set.origin)
 		}
-		for _, client := range deferredClients {
-			if client.options == nil {
-				if manager.DefaultTransport() == nil {
-					return nil, E.New("prepare ", client.origin, ": default http client transport is not initialized")
-				}
-			} else if _, err = manager.ResolveTransport(ctx, logger, *client.options); err != nil {
-				return nil, E.Cause(err, "prepare ", client.origin)
-			}
-		}
+		transport.CloseIdleConnections()
 	}
 	for i, configRule := range instance.Router().Rules() {
 		// Rule.Start resolves references only; it does not start the router.
@@ -286,54 +264,57 @@ func PrepareRuleSets(configContent string) (*StringBox, error) {
 	return wrapString(string(preparedConfig)), nil
 }
 
-func ruleSetUsesZeroTier(ctx context.Context, options option.Options, transport option.HTTPClientOptions) (bool, error) {
+func resolveRuleSetBootstrapHTTP(options option.Options, remote option.RemoteRuleSet) (option.HTTPClientOptions, error) {
+	if remote.HTTPClient != nil && !remote.HTTPClient.IsEmpty() {
+		if remote.DownloadDetour != "" { //nolint:staticcheck
+			return option.HTTPClientOptions{}, E.New("http_client is conflict with deprecated download_detour field")
+		}
+		if remote.HTTPClient.Tag == "" {
+			return *remote.HTTPClient, nil
+		}
+	} else if remote.DownloadDetour != "" { //nolint:staticcheck
+		return option.HTTPClientOptions{
+			DialerOptions:           option.DialerOptions{Detour: remote.DownloadDetour}, //nolint:staticcheck
+			DisableEmptyDirectCheck: true,
+		}, nil
+	}
+	tag := options.Route.DefaultHTTPClient
+	if remote.HTTPClient != nil && remote.HTTPClient.Tag != "" {
+		tag = remote.HTTPClient.Tag
+	} else if tag == "" && len(options.HTTPClients) > 0 {
+		tag = options.HTTPClients[0].Tag
+	}
+	if tag == "" {
+		return option.HTTPClientOptions{DefaultOutbound: true}, nil
+	}
+	for _, client := range options.HTTPClients {
+		if client.Tag == tag {
+			return client.Options(), nil
+		}
+	}
+	return option.HTTPClientOptions{}, E.New("http_client not found: ", tag)
+}
+
+func ruleSetUsesZeroTier(options option.Options, transport option.HTTPClientOptions) bool {
 	tag := transport.Detour
 	if tag == "" && transport.DefaultOutbound {
 		tag = options.Route.Final
-		if tag == "" && len(options.Outbounds) > 0 {
-			tag = options.Outbounds[0].Tag
-			if tag == "" {
-				tag = "0"
-			}
+	}
+	if tag == "" {
+		return false
+	}
+	// The outbound manager resolves an outbound before an endpoint with the same tag.
+	for i, outbound := range options.Outbounds {
+		if outbound.Tag == tag || (outbound.Tag == "" && strconv.Itoa(i) == tag) {
+			return false
 		}
 	}
-resolve:
-	for depth := 0; tag != "" && depth <= len(options.Outbounds); depth++ {
-		// Explicit outbounds take precedence over endpoints with the same tag.
-		for i, outbound := range options.Outbounds {
-			if outbound.Tag != tag && (outbound.Tag != "" || strconv.Itoa(i) != tag) {
-				continue
-			}
-			selector, isSelector := outbound.Options.(*option.SelectorOutboundOptions)
-			if !isSelector {
-				return false, nil
-			}
-			if depth == 0 {
-				// The mobile runtime also uses a cache with no cache_file block.
-				// An existing cache can override the selector's configured default.
-				var path string
-				if options.Experimental != nil && options.Experimental.CacheFile != nil {
-					path = options.Experimental.CacheFile.Path
-				}
-				if _, err := os.Lstat(cachefile.Path(ctx, path)); !os.IsNotExist(err) {
-					return false, nil
-				}
-			}
-			selected, err := group.InitialSelectorTag(selector.Outbounds, selector.Default, "")
-			if err != nil {
-				return false, E.Cause(err, "selector[", tag, "]")
-			}
-			tag = selected
-			continue resolve
+	for i, endpoint := range options.Endpoints {
+		if endpoint.Tag == tag || (endpoint.Tag == "" && strconv.Itoa(i) == tag) {
+			return endpoint.Type == C.TypeZeroTier
 		}
-		for i, endpoint := range options.Endpoints {
-			if endpoint.Tag == tag || (endpoint.Tag == "" && strconv.Itoa(i) == tag) {
-				return endpoint.Type == C.TypeZeroTier, nil
-			}
-		}
-		return false, nil
 	}
-	return false, nil
+	return false
 }
 
 func checkRuleSetBootstrapHTTP(certificates *option.CertificateOptions, transport option.HTTPClientOptions, url string) error {

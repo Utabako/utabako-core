@@ -97,34 +97,15 @@ func (m *Manager) DefaultTransport() adapter.HTTPTransport {
 	return newSharedRef(m.defaultTransport.managed, m.defaultTransport.shared)
 }
 
-// TransportOptions resolves the configuration of an inline, named or default
-// client without creating a transport. Nil selects the default.
-func (m *Manager) TransportOptions(options *option.HTTPClientOptions) (option.HTTPClientOptions, error) {
-	if options == nil {
-		if m.defaultTag == "" {
-			return option.HTTPClientOptions{DefaultOutbound: true}, nil
-		}
-		options = &option.HTTPClientOptions{Tag: m.defaultTag}
-	}
-	if options.Tag == "" {
-		return *options, nil
-	}
-	define, loaded := m.defines[options.Tag]
-	if !loaded {
-		return option.HTTPClientOptions{}, E.New("http_client not found: ", options.Tag)
-	}
-	resolved := define.Options()
-	resolved.ResolveOnDetour = options.ResolveOnDetour
-	return resolved, nil
-}
-
 func (m *Manager) ResolveTransport(ctx context.Context, logger logger.ContextLogger, options option.HTTPClientOptions) (adapter.HTTPTransport, error) {
 	if options.Tag != "" {
 		if options.ResolveOnDetour {
-			resolvedOptions, err := m.TransportOptions(&options)
-			if err != nil {
-				return nil, err
+			define, loaded := m.defines[options.Tag]
+			if !loaded {
+				return nil, E.New("http_client not found: ", options.Tag)
 			}
+			resolvedOptions := define.Options()
+			resolvedOptions.ResolveOnDetour = true
 			transport, err := NewTransport(ctx, logger, options.Tag, resolvedOptions)
 			if err != nil {
 				return nil, err
@@ -158,11 +139,11 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	if sharedTransport, loaded := m.sharedTransports[tag]; loaded {
 		return sharedTransport, nil
 	}
-	options, err := m.TransportOptions(&option.HTTPClientOptions{Tag: tag})
-	if err != nil {
-		return nil, err
+	define, loaded := m.defines[tag]
+	if !loaded {
+		return nil, E.New("http_client not found: ", tag)
 	}
-	transport, err := NewTransport(m.ctx, m.logger, tag, options)
+	transport, err := NewTransport(m.ctx, m.logger, tag, define.Options())
 	if err != nil {
 		return nil, E.Cause(err, "create shared http_client[", tag, "]")
 	}

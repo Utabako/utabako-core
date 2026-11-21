@@ -16,7 +16,6 @@ import (
 const defaultBackgroundPollInterval = 200 * time.Millisecond
 
 type endpointNetworkState struct {
-	changed        chan struct{}
 	hasConfig      bool
 	networkClosed  bool
 	status         zt.VirtualNetworkStatus

@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
+	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/tun"
@@ -171,6 +172,7 @@ func TestStartOrReloadServicePreCanceled(t *testing.T) {
 	require.Empty(t, server.GetStartupStage())
 }
 
+const startupProbeType = "startup-probe"
 const startupProbeProfile = `{"log":{"disabled":true},"inbounds":[{"type":"startup-probe"}]}`
 
 type startupProbeInbound struct {
@@ -179,7 +181,7 @@ type startupProbeInbound struct {
 }
 
 func (i *startupProbeInbound) Start(stage adapter.StartStage, _ *adapter.Scope) error {
-	if stage == adapter.StartStateStart && i.onStart != nil {
+	if stage == adapter.StartStateInitialize && i.onStart != nil {
 		i.onStart()
 	}
 	return nil
@@ -215,8 +217,14 @@ func awaitStartupProbe[T any](t *testing.T, ctx context.Context, updates <-chan 
 }
 
 func TestStartOrReloadServiceCancelsConstruction(t *testing.T) {
-	for _, name := range []string{"options cancellation", "close service"} {
-		t.Run(name, func(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		close bool
+	}{
+		{"options cancellation", false},
+		{"close service", true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
 			testCtx, timeout := context.WithTimeout(t.Context(), 10*time.Second)
 			defer timeout()
 			server := newTestCommandServer(t)
@@ -225,33 +233,33 @@ func TestStartOrReloadServiceCancelsConstruction(t *testing.T) {
 				_ = server.StartedService.SubscribeServiceStatus(nil, &startupStatusStream{ctx: testCtx, updates: updates})
 			}()
 			require.Equal(t, daemon.ServiceStatus_IDLE, awaitStartupProbe(t, testCtx, updates))
+
 			loading := make(chan struct{})
 			beginWait := make(chan struct{})
 			waiting := make(chan struct{})
 			constructorErr := make(chan error, 1)
 			registry := service.FromContext[adapter.InboundRegistry](server.ctx).(*inbound.Registry)
-			var enabled bool
-			inbound.Register(registry, "startup-probe", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
+			var startedInbound bool
+			inbound.Register(registry, startupProbeType, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
 				progress := service.PtrFromContext[adapter.RuleSetStartup](ctx)
 				if progress == nil {
-					return nil, errors.New("startup progress did not reach the box")
+					return nil, errors.New("startup progress did not reach box construction")
 				}
-				progress.BeginLoading()
+				defer progress.BeginLoading()()
 				close(loading)
 				select {
 				case <-beginWait:
 				case <-testCtx.Done():
 					return nil, testCtx.Err()
 				}
-				// Keep the phase reported until the daemon discards this attempt.
-				progress.BeginZeroTierWait()
+				defer progress.BeginZeroTierWait()()
 				close(waiting)
 				select {
 				case <-ctx.Done():
 					constructorErr <- ctx.Err()
 					return &startupProbeInbound{
-						Adapter: inbound.NewAdapter("startup-probe", tag),
-						onStart: func() { enabled = true },
+						Adapter: inbound.NewAdapter(startupProbeType, tag),
+						onStart: func() { startedInbound = true },
 					}, nil
 				case <-testCtx.Done():
 					return nil, testCtx.Err()
@@ -268,7 +276,7 @@ func TestStartOrReloadServiceCancelsConstruction(t *testing.T) {
 			awaitStartupProbe(t, testCtx, waiting)
 			require.Equal(t, "waiting-zerotier-authorization", server.GetStartupStage())
 			require.Nil(t, server.StartedService.Instance(), "constructor has not returned")
-			if name == "close service" {
+			if testCase.close {
 				closed := make(chan error, 1)
 				go func() { closed <- server.CloseService() }()
 				require.NoError(t, awaitStartupProbe(t, testCtx, closed))
@@ -279,7 +287,7 @@ func TestStartOrReloadServiceCancelsConstruction(t *testing.T) {
 			require.NoError(t, awaitStartupProbe(t, testCtx, started))
 			require.Equal(t, daemon.ServiceStatus_STOPPING, awaitStartupProbe(t, testCtx, updates))
 			require.Equal(t, daemon.ServiceStatus_IDLE, awaitStartupProbe(t, testCtx, updates))
-			require.False(t, enabled)
+			require.False(t, startedInbound)
 			require.Nil(t, server.StartedService.Instance())
 			require.Empty(t, server.GetStartupStage())
 		})
@@ -290,21 +298,24 @@ func TestStartupCancellationDoesNotStopStartedInstance(t *testing.T) {
 	server := newTestCommandServer(t)
 	var boxCtx context.Context
 	registry := service.FromContext[adapter.InboundRegistry](server.ctx).(*inbound.Registry)
-	inbound.Register(registry, "startup-probe", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
+	inbound.Register(registry, startupProbeType, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
 		boxCtx = ctx
-		return &startupProbeInbound{Adapter: inbound.NewAdapter("startup-probe", tag)}, nil
+		return &startupProbeInbound{Adapter: inbound.NewAdapter(startupProbeType, tag)}, nil
 	})
 	options := new(OverrideOptions)
-	requestCtx, cancel := context.WithCancel(t.Context())
+	requestCtx, ok := locale.ContextWithLocale(t.Context(), "zh-Hans")
+	require.True(t, ok)
+	requestCtx, cancel := context.WithCancel(requestCtx)
 	cancel()
 
-	// An RPC request contributes the locale but not its cancellation to the box.
+	// An RPC request contributes its locale, not its cancellation.
 	require.NoError(t, server.StartedService.StartOrReloadService(requestCtx, startupProbeProfile, &daemon.OverrideOptions{
 		Cancellation: &options.cancellation,
 	}))
 	instance := server.StartedService.Instance()
 	require.NotNil(t, instance)
 	require.Empty(t, server.GetStartupStage())
+	require.Equal(t, "zh-Hans", locale.FromContext(boxCtx).Locale)
 
 	options.Cancel()
 	require.NoError(t, boxCtx.Err())
