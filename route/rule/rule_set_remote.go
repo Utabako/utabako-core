@@ -130,7 +130,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		}
 	}
 	if s.lastUpdated.IsZero() && !loadedFromInitialPath {
-		err = s.fetch(ctx, true)
+		fetchCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		err = s.fetch(adapter.ContextWithRuleSetStartupRequest(fetchCtx), true)
 		if err != nil {
 			return E.Cause(err, "initial rule-set: ", s.tag)
 		}

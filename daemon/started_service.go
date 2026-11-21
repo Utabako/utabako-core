@@ -60,6 +60,7 @@ type StartedService struct {
 	serviceAccess           sync.RWMutex
 	closed                  bool
 	startInterrupted        bool
+	startup                 *serviceStartup
 	serviceStatus           *ServiceStatus
 	serviceStatusSubscriber *observable.Subscriber[*ServiceStatus]
 	serviceStatusObserver   *observable.Observer[*ServiceStatus]
@@ -75,6 +76,62 @@ type StartedService struct {
 	clashModeObserver       *observable.Observer[struct{}]
 	notificationSubscriber  *observable.Subscriber[*NotificationEvent]
 	notificationObserver    *observable.Observer[*NotificationEvent]
+}
+
+type serviceStartup struct {
+	cancel   context.CancelFunc
+	progress adapter.RuleSetStartup
+}
+
+// StartupCancellation can be used by one start attempt.
+type StartupCancellation struct {
+	access sync.Mutex
+	used   bool
+	cancel context.CancelFunc
+}
+
+// Cancel prevents or interrupts startup. It has no effect after finalization.
+func (c *StartupCancellation) Cancel() {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.used = true
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+}
+
+// Used reports whether the handle was already canceled or claimed by a start.
+func (c *StartupCancellation) Used() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.used
+}
+
+func (c *StartupCancellation) attach(cancel context.CancelFunc) bool {
+	if c == nil {
+		return true
+	}
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.used {
+		return false
+	}
+	c.used = true
+	c.cancel = cancel
+	return true
+}
+
+// finish detaches the cancel function and reports whether Cancel won the handoff.
+func (c *StartupCancellation) finish() bool {
+	if c == nil {
+		return false
+	}
+	c.access.Lock()
+	defer c.access.Unlock()
+	interrupted := c.cancel == nil
+	c.cancel = nil
+	return interrupted
 }
 
 type ServiceOptions struct {
@@ -159,11 +216,20 @@ func (s *StartedService) updateStatusError(err error) {
 
 func (s *StartedService) interruptStart() {
 	s.serviceAccess.Lock()
-	if s.serviceStatus.Status == ServiceStatus_STARTING && s.instance != nil {
+	if s.startup != nil {
 		s.startInterrupted = true
-		s.instance.cancel()
+		s.startup.cancel()
 	}
 	s.serviceAccess.Unlock()
+}
+
+func (s *StartedService) GetStartupStage() string {
+	s.serviceAccess.RLock()
+	defer s.serviceAccess.RUnlock()
+	if s.startup == nil {
+		return ""
+	}
+	return s.startup.progress.Stage()
 }
 
 func (s *StartedService) waitForStarted(ctx context.Context) error {
@@ -248,14 +314,37 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
 }
 
 func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
+	// Only the locale comes from the request. The instance outlives that request.
+	selectedLocale := locale.FromContext(ctx)
+	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
+	ctx, cancel := context.WithCancel(ctx)
+	var cancellation *StartupCancellation
+	if options != nil {
+		cancellation = options.Cancellation
+	}
+	if !cancellation.attach(cancel) {
+		cancel()
+		return nil
+	}
 	s.interruptStart()
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
 	s.serviceAccess.Lock()
-	if s.closed {
+	if err := ctx.Err(); s.closed || err != nil {
+		if s.closed {
+			err = os.ErrClosed
+		}
+		interrupted := cancellation.finish()
 		s.serviceAccess.Unlock()
-		return os.ErrClosed
+		cancel()
+		if interrupted {
+			return nil
+		}
+		return err
 	}
+	s.startInterrupted = false
+	startup := &serviceStartup{cancel: cancel}
+	s.startup = startup
 	oldInstance := s.instance
 	if oldInstance != nil {
 		s.instance = nil
@@ -270,42 +359,59 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 		runtimeDebug.FreeOSMemory()
 		s.serviceAccess.Lock()
 	}
-	s.startInterrupted = false
 	s.updateStatus(ServiceStatus_STARTING)
 	if oldInstance == nil {
 		s.resetLogs()
 	}
 	s.serviceAccess.Unlock()
-	instance, err := s.newInstance(ctx, profileContent, options, oldInstance != nil)
-	if err != nil {
+	var instance *Instance
+	err := ctx.Err()
+	if err == nil {
+		instance, err = s.newInstance(ctx, startup, profileContent, options, oldInstance != nil)
+	}
+	if err == nil {
+		instance.urlTestHistoryStorage.AddUpdateHook(s.urlTestSubscriber)
+		if instance.clashMode != nil {
+			instance.clashMode.AddUpdateHook(s.clashModeSubscriber)
+		}
 		s.serviceAccess.Lock()
-		s.updateStatusError(err)
+		err = ctx.Err()
+		if err == nil {
+			s.instance = instance
+		}
 		s.serviceAccess.Unlock()
-		return err
-	}
-	instance.urlTestHistoryStorage.AddUpdateHook(s.urlTestSubscriber)
-	if instance.clashMode != nil {
-		instance.clashMode.AddUpdateHook(s.clashModeSubscriber)
+		if err == nil {
+			err = instance.Start()
+		}
 	}
 	s.serviceAccess.Lock()
-	s.instance = instance
-	s.serviceAccess.Unlock()
-	err = instance.Start()
-	s.serviceAccess.Lock()
-	if s.startInterrupted {
-		s.startInterrupted = false
-		s.instance = nil
-		s.serviceAccess.Unlock()
-		_ = instance.Close()
-		runtimeDebug.FreeOSMemory()
-		return nil
+	// Serialize finalization with both CloseService and OverrideOptions.Cancel.
+	interrupted := cancellation.finish() || s.startInterrupted
+	s.startInterrupted = false
+	s.startup = nil
+	if err == nil {
+		err = ctx.Err()
 	}
-	if err != nil {
+	if interrupted || err != nil {
 		s.instance = nil
-		s.updateStatusError(err)
+		if interrupted {
+			s.updateStatus(ServiceStatus_STOPPING)
+		} else {
+			s.updateStatusError(err)
+		}
 		s.serviceAccess.Unlock()
-		_ = instance.Close()
-		runtimeDebug.FreeOSMemory()
+		cancel()
+		if instance != nil {
+			_ = instance.Close()
+			runtimeDebug.FreeOSMemory()
+		}
+		if interrupted {
+			s.serviceAccess.Lock()
+			s.startedAt = time.Time{}
+			s.updateStatus(ServiceStatus_IDLE)
+			s.serviceAccess.Unlock()
+			return nil
+		}
 		return err
 	}
 	s.startedAt = time.Now()

@@ -253,6 +253,8 @@ func (ep *Endpoint) waitForNetworkStart() error {
 		select {
 		case <-ep.done:
 			return E.New("node closed while waiting for ZeroTier network configuration")
+		case <-ep.ctx.Done():
+			return ep.ctx.Err()
 		case <-deadline.C:
 			return E.New("timeout waiting for ZeroTier network configuration")
 		case <-ticker.C:

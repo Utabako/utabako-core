@@ -6,30 +6,31 @@ import (
 	"net/netip"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
+	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/service/powerreport"
 	singtun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 // Stop after real TUN construction: exercise SDK -> daemon -> box.New without
 // opening an OS interface or requiring root. The captured options feed the stack.
 func overrideTestServer(t *testing.T, capture func(string, option.TunInboundOptions) error) *CommandServer {
 	t.Helper()
-	previousBasePath := sBasePath
-	sBasePath = t.TempDir()
-	t.Cleanup(func() { sBasePath = previousBasePath })
-	ctx := baseContext(nil)
-	registry := service.FromContext[adapter.InboundRegistry](ctx).(*inbound.Registry)
+	server := newTestCommandServer(t)
+	registry := service.FromContext[adapter.InboundRegistry](server.ctx).(*inbound.Registry)
 	inbound.Register(registry, C.TypeTun, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
 		instance, err := tun.NewInbound(ctx, router, logger, tag, options)
 		if err != nil {
@@ -40,8 +41,20 @@ func overrideTestServer(t *testing.T, capture func(string, option.TunInboundOpti
 		}
 		return instance, nil
 	})
+	return server
+}
+
+func newTestCommandServer(t *testing.T) *CommandServer {
+	t.Helper()
+	previousBasePath := sBasePath
+	sBasePath = t.TempDir()
+	t.Cleanup(func() { sBasePath = previousBasePath })
+	ctx := filemanager.WithDefault(baseContext(nil), sBasePath, sBasePath, os.Getuid(), os.Getgid())
 	started := daemon.NewStartedService(daemon.ServiceOptions{Context: ctx, LogMaxLines: 10})
-	t.Cleanup(started.Close)
+	t.Cleanup(func() {
+		_ = started.CloseService()
+		started.Close()
+	})
 	return &CommandServer{StartedService: started, ctx: ctx, powerManager: powerreport.NewManager()}
 }
 
@@ -146,4 +159,169 @@ func TestStartOrReloadServiceDisableIPv6IncompatibleTUN(t *testing.T) {
 			require.Equal(t, profile, string(snapshot))
 		})
 	}
+}
+
+func TestStartOrReloadServicePreCanceled(t *testing.T) {
+	server := newTestCommandServer(t)
+	options := new(OverrideOptions)
+	options.Cancel()
+
+	require.NoError(t, server.StartOrReloadService("invalid config", options))
+	require.NoFileExists(t, configSnapshotPath())
+	require.Nil(t, server.StartedService.Instance())
+	require.Empty(t, server.GetStartupStage())
+}
+
+const startupProbeType = "startup-probe"
+const startupProbeProfile = `{"log":{"disabled":true},"inbounds":[{"type":"startup-probe"}]}`
+
+type startupProbeInbound struct {
+	inbound.Adapter
+	onStart func()
+}
+
+func (i *startupProbeInbound) Start(stage adapter.StartStage, _ *adapter.Scope) error {
+	if stage == adapter.StartStateInitialize && i.onStart != nil {
+		i.onStart()
+	}
+	return nil
+}
+
+type startupStatusStream struct {
+	grpc.ServerStreamingServer[daemon.ServiceStatus]
+	ctx     context.Context
+	updates chan daemon.ServiceStatus_Type
+}
+
+func (s *startupStatusStream) Context() context.Context { return s.ctx }
+
+func (s *startupStatusStream) Send(status *daemon.ServiceStatus) error {
+	select {
+	case s.updates <- status.Status:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+}
+
+func awaitStartupProbe[T any](t *testing.T, ctx context.Context, updates <-chan T) T {
+	t.Helper()
+	select {
+	case update := <-updates:
+		return update
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+		var zero T
+		return zero
+	}
+}
+
+func TestStartOrReloadServiceCancelsConstruction(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		close bool
+	}{
+		{"options cancellation", false},
+		{"close service", true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			testCtx, timeout := context.WithTimeout(t.Context(), 10*time.Second)
+			defer timeout()
+			server := newTestCommandServer(t)
+			updates := make(chan daemon.ServiceStatus_Type, 4)
+			go func() {
+				_ = server.StartedService.SubscribeServiceStatus(nil, &startupStatusStream{ctx: testCtx, updates: updates})
+			}()
+			require.Equal(t, daemon.ServiceStatus_IDLE, awaitStartupProbe(t, testCtx, updates))
+
+			loading := make(chan struct{})
+			beginWait := make(chan struct{})
+			waiting := make(chan struct{})
+			constructorErr := make(chan error, 1)
+			registry := service.FromContext[adapter.InboundRegistry](server.ctx).(*inbound.Registry)
+			var startedInbound bool
+			inbound.Register(registry, startupProbeType, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
+				progress := service.PtrFromContext[adapter.RuleSetStartup](ctx)
+				if progress == nil {
+					return nil, errors.New("startup progress did not reach box construction")
+				}
+				defer progress.BeginLoading()()
+				close(loading)
+				select {
+				case <-beginWait:
+				case <-testCtx.Done():
+					return nil, testCtx.Err()
+				}
+				defer progress.BeginZeroTierWait()()
+				close(waiting)
+				select {
+				case <-ctx.Done():
+					constructorErr <- ctx.Err()
+					return &startupProbeInbound{
+						Adapter: inbound.NewAdapter(startupProbeType, tag),
+						onStart: func() { startedInbound = true },
+					}, nil
+				case <-testCtx.Done():
+					return nil, testCtx.Err()
+				}
+			})
+			options := new(OverrideOptions)
+			started := make(chan error, 1)
+			go func() { started <- server.StartOrReloadService(startupProbeProfile, options) }()
+
+			awaitStartupProbe(t, testCtx, loading)
+			require.Equal(t, daemon.ServiceStatus_STARTING, awaitStartupProbe(t, testCtx, updates))
+			require.Equal(t, "loading-rule-sets", server.GetStartupStage())
+			close(beginWait)
+			awaitStartupProbe(t, testCtx, waiting)
+			require.Equal(t, "waiting-zerotier-authorization", server.GetStartupStage())
+			require.Nil(t, server.StartedService.Instance(), "constructor has not returned")
+			if testCase.close {
+				closed := make(chan error, 1)
+				go func() { closed <- server.CloseService() }()
+				require.NoError(t, awaitStartupProbe(t, testCtx, closed))
+			} else {
+				options.Cancel()
+			}
+			require.ErrorIs(t, awaitStartupProbe(t, testCtx, constructorErr), context.Canceled)
+			require.NoError(t, awaitStartupProbe(t, testCtx, started))
+			require.Equal(t, daemon.ServiceStatus_STOPPING, awaitStartupProbe(t, testCtx, updates))
+			require.Equal(t, daemon.ServiceStatus_IDLE, awaitStartupProbe(t, testCtx, updates))
+			require.False(t, startedInbound)
+			require.Nil(t, server.StartedService.Instance())
+			require.Empty(t, server.GetStartupStage())
+		})
+	}
+}
+
+func TestStartupCancellationDoesNotStopStartedInstance(t *testing.T) {
+	server := newTestCommandServer(t)
+	var boxCtx context.Context
+	registry := service.FromContext[adapter.InboundRegistry](server.ctx).(*inbound.Registry)
+	inbound.Register(registry, startupProbeType, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
+		boxCtx = ctx
+		return &startupProbeInbound{Adapter: inbound.NewAdapter(startupProbeType, tag)}, nil
+	})
+	options := new(OverrideOptions)
+	requestCtx, ok := locale.ContextWithLocale(t.Context(), "zh-Hans")
+	require.True(t, ok)
+	requestCtx, cancel := context.WithCancel(requestCtx)
+	cancel()
+
+	// An RPC request contributes its locale, not its cancellation.
+	require.NoError(t, server.StartedService.StartOrReloadService(requestCtx, startupProbeProfile, &daemon.OverrideOptions{
+		Cancellation: &options.cancellation,
+	}))
+	instance := server.StartedService.Instance()
+	require.NotNil(t, instance)
+	require.Empty(t, server.GetStartupStage())
+	require.Equal(t, "zh-Hans", locale.FromContext(boxCtx).Locale)
+
+	options.Cancel()
+	require.NoError(t, boxCtx.Err())
+	require.NoError(t, server.StartOrReloadService("invalid config", options))
+	require.Same(t, instance, server.StartedService.Instance())
+
+	require.NoError(t, server.CloseService())
+	require.ErrorIs(t, boxCtx.Err(), context.Canceled)
 }

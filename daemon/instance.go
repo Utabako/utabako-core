@@ -82,17 +82,15 @@ type OverrideOptions struct {
 	DisableIPv6    bool
 	IncludePackage []string
 	ExcludePackage []string
+	Cancellation   *StartupCancellation
 }
 
-func (s *StartedService) newInstance(ctx context.Context, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
-	selectedLocale := locale.FromContext(ctx)
-	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
+func (s *StartedService) newInstance(ctx context.Context, startup *serviceStartup, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
 	ctx = service.ExtendContext(ctx)
+	ctx = service.ContextWithPtr(ctx, &startup.progress)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
-	ctx, cancel := context.WithCancel(ctx)
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	if overrideOptions != nil {
@@ -100,7 +98,6 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 			for _, inbound := range options.Inbounds {
 				if tunOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {
 					if err = disableTUNIPv6(tunOptions); err != nil {
-						cancel()
 						return nil, E.Cause(err, "inbound/tun[", inbound.Tag, "]")
 					}
 				}
@@ -129,11 +126,14 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 			})
 		}
 	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 	urlTestHistoryStorage := urltest.NewHistoryStorage()
 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
 	i := &Instance{
 		ctx:                   ctx,
-		cancel:                cancel,
+		cancel:                startup.cancel,
 		urlTestHistoryStorage: urlTestHistoryStorage,
 	}
 	boxInstance, err := box.New(box.Options{
@@ -142,7 +142,6 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 		PlatformLogWriter: s,
 	})
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	i.instance = boxInstance

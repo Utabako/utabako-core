@@ -193,9 +193,19 @@ type OverrideOptions struct {
 	DisableIPv6    bool
 	IncludePackage StringIterator
 	ExcludePackage StringIterator
+
+	cancellation daemon.StartupCancellation
+}
+
+// Cancel prevents or interrupts this start attempt, without stopping a running service.
+func (o *OverrideOptions) Cancel() {
+	o.cancellation.Cancel()
 }
 
 func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
+	if options.cancellation.Used() {
+		return nil
+	}
 	saveConfigSnapshot(configContent)
 	if s.powerManager.Recorder() != nil {
 		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
@@ -205,6 +215,7 @@ func (s *CommandServer) StartOrReloadService(configContent string, options *Over
 		DisableIPv6:    options.DisableIPv6,
 		IncludePackage: iteratorToArray(options.IncludePackage),
 		ExcludePackage: iteratorToArray(options.ExcludePackage),
+		Cancellation:   &options.cancellation,
 	})
 	if err != nil {
 		return E.Cause(err, "start or reload service")
@@ -214,6 +225,11 @@ func (s *CommandServer) StartOrReloadService(configContent string, options *Over
 
 func (s *CommandServer) CloseService() error {
 	return s.StartedService.CloseService()
+}
+
+// GetStartupStage reports rule-set startup progress, or an empty string otherwise.
+func (s *CommandServer) GetStartupStage() string {
+	return s.StartedService.GetStartupStage()
 }
 
 func (s *CommandServer) WriteMessage(level int32, message string) {

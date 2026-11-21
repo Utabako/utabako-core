@@ -137,10 +137,9 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 		}
 	case adapter.StartStateStart:
-		var startContext *adapter.HTTPStartContext
 		if len(r.ruleSets) > 0 {
 			monitor.Start("initialize rule-set")
-			startContext = adapter.NewHTTPStartContext()
+			startContext := adapter.NewHTTPStartContext()
 			var ruleSetStartGroup task.Group
 			for i, ruleSet := range r.ruleSets {
 				ruleSetInPlace := ruleSet
@@ -154,14 +153,23 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			ruleSetStartGroup.Concurrency(5)
 			ruleSetStartGroup.FastFail()
-			err := ruleSetStartGroup.Run(r.ctx)
+			startCtx := scope.Context()
+			var finishLoading func()
+			if progress := service.PtrFromContext[adapter.RuleSetStartup](startCtx); progress != nil {
+				finishLoading = progress.BeginLoading()
+			}
+			err := ruleSetStartGroup.Run(startCtx)
+			if finishLoading != nil {
+				finishLoading()
+			}
+			startContext.Close()
 			monitor.Finish()
 			if err != nil {
 				return err
 			}
 		}
-		if startContext != nil {
-			startContext.Close()
+		if err := scope.Context().Err(); err != nil {
+			return err
 		}
 		r.ruleSetUpdater = R.NewRuleSetUpdater(r.ctx, r.ruleSets)
 		if r.ruleSetUpdater != nil {
